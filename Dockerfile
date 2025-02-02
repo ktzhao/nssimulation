@@ -1,5 +1,5 @@
 # 选择官方 Julia slim 版本作为基础镜像
-FROM julia:1.9-slim
+FROM julia:1.9.3-slim
 
 # 设置工作目录（后续所有操作均在此目录中执行）
 WORKDIR /home/zhao/juliaworkspace
