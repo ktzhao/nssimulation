@@ -73,7 +73,7 @@ end
 
 # Solve TOV equations for a given central pressure P_c.
 function solve_TOV(P_c)
-    r0 = 1e-3         # Starting radius to avoid singularity at r=0.
+    r0 = 1e-3      # Starting radius to avoid singularity at r=0.
     m0 = 0.0
     u0 = [m0, P_c]
     prob = ODEProblem(TOV!, u0, (r0, 20.0))
@@ -84,7 +84,7 @@ function solve_TOV(P_c)
     cb = ContinuousCallback(condition, affect!)
     
     
-    sol = solve(prob, Rosenbrock23(), reltol=1e-8, abstol=1e-10, callback=cb)
+    sol = solve(prob, Rosenbrock23(), reltol=1e-5, abstol=1e-7, callback=cb)
     return sol
 
 end
@@ -192,7 +192,7 @@ function solve_TOV_coupled(P_c, β, B0)
     cb = ContinuousCallback(condition, affect!)
     
 
-    sol = solve(prob, Rosenbrock23(), reltol=1e-8, abstol=1e-10, callback=cb)
+    sol = solve(prob, Rosenbrock23(), reltol=1e-5, abstol=1e-7, callback=cb)
     return sol
 end
 
