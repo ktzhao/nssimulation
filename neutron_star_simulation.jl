@@ -6,12 +6,13 @@
 # 2. 纯偶极磁场分布计算
 # 3. 耦合模型：在 TOV 方程中加入简单的磁场修正项
 #
-# 依赖包：DifferentialEquations.jl, Plots.jl, LinearAlgebra
+# 依赖包：DifferentialEquations.jl, Plots.jl, LinearAlgebra, StaticArrays
 ################################################################################
 
 using DifferentialEquations
 using Plots
 using LinearAlgebra
+using StaticArrays
 
 ################################################################################
 # 1. TOV 方程求解 —— 中子星内部结构
@@ -55,10 +56,15 @@ function solve_TOV(P_c)
     r0 = 1e-6               # 初始半径（避免 r=0）
     m0 = 0.0                # 中心处质量为 0
     u0 = [m0, P_c]          # 初始条件向量
-    # 定义积分区间，例如到 r = 20（单位长度），并设定终止条件：当 P 降到极小值时停止积分
+    # 定义积分区间，例如到 r = 20（单位长度）
     prob = ODEProblem(TOV!, u0, (r0, 20.0), nothing)
-    sol = solve(prob, Tsit5(), reltol=1e-8, abstol=1e-10,
-                stop_condition = (u, t, integrator) -> u[2] < 1e-8)
+    
+    # 使用 ContinuousCallback 来实现当 P < 1e-8 时终止积分
+    condition(u, t, integrator) = u[2] - 1e-8
+    affect!(integrator) = terminate!(integrator)
+    cb = ContinuousCallback(condition, affect!)
+    
+    sol = solve(prob, Tsit5(), reltol=1e-8, abstol=1e-10, callback=cb)
     return sol
 end
 
@@ -162,8 +168,13 @@ function solve_TOV_coupled(P_c, β, B0)
     u0 = [m0, P_c]
     params = (β, B0)
     prob = ODEProblem(TOV_coupled!, u0, (r0, 20.0), params)
-    sol = solve(prob, Tsit5(), reltol=1e-8, abstol=1e-10,
-                stop_condition=(u, t, integrator) -> u[2] < 1e-8)
+    
+    # 同样使用 ContinuousCallback 来停止积分
+    condition(u, t, integrator) = u[2] - 1e-8
+    affect!(integrator) = terminate!(integrator)
+    cb = ContinuousCallback(condition, affect!)
+    
+    sol = solve(prob, Tsit5(), reltol=1e-8, abstol=1e-10, callback=cb)
     return sol
 end
 
@@ -188,7 +199,6 @@ println("已生成压力分布对比图：pressure_profile_comparison.png")
 ################################################################################
 
 # 本代码示例实现了：
-
 #   1. 通过 DifferentialEquations.jl 求解 TOV 方程得到中子星质量-半径曲线；
 #   2. 利用解析公式计算纯偶极磁场分布，并绘制磁场强度热图；
 #   3. 将磁场修正项简单引入 TOV 方程，构建耦合模型，并比较耦合前后的压力分布变化。
