@@ -28,38 +28,36 @@ function eos(ρ)
     return K * ρ^gamma
 end
 
-# 由于 TOV 方程通常以压力 P 为主要变量，
-# 我们采用 EOS 的反函数：ρ(P) = (P/K)^(1/γ)
-ρ_of_P(P) = (P / K)^(1 / gamma)
+# EOS 的反函数：给定压力 P，计算能量密度 ρ
+ρ_of_P(P) = (max(P, 0) / K)^(1 / gamma)
 
-# TOV 方程组：
-# dm/dr = 4π r^2 ε, 其中 ε = ρ(P)
-# dP/dr = - ((ε + P) (m + 4π r^3 P)) / (r (r - 2m))
-function TOV!(du, u, r, params)
+# TOV 方程组（in-place 格式）：函数签名为 f(du, u, p, t)
+# 其中 t 作为独立变量（代表半径 r），p 没有用到
+function TOV!(du, u, p, t)
     m, P = u
-    # 为避免 r=0 时分母为 0，使用近似处理
-    if r < 1e-6
+    # 避免 r=0 的问题
+    if t < 1e-6
         du[1] = 0.0
         du[2] = 0.0
         return
     end
     ρ = ρ_of_P(P)
     ε = ρ  # 简单近似：ε = ρ
-    dm_dr = 4π * r^2 * ε
-    dP_dr = -((ε + P) * (m + 4π * r^3 * P)) / (r * (r - 2 * m))
+    dm_dr = 4π * t^2 * ε
+    dP_dr = -((ε + P) * (m + 4π * t^3 * P)) / (t * (t - 2 * m))
     du[1] = dm_dr
     du[2] = dP_dr
 end
 
 # 求解 TOV 方程，给定中心压力 P_c
 function solve_TOV(P_c)
-    r0 = 1e-6               # 初始半径（避免 r=0）
-    m0 = 0.0                # 中心处质量为 0
+    r0 = 1e-6               # 初始半径，避免 r=0
+    m0 = 0.0                # 中心质量为 0
     u0 = [m0, P_c]          # 初始条件向量
-    # 定义积分区间，例如到 r = 20（单位长度）
-    prob = ODEProblem(TOV!, u0, (r0, 20.0), nothing)
+    # 创建 ODEProblem，不传入参数 p（默认 p = nothing）
+    prob = ODEProblem(TOV!, u0, (r0, 20.0))
     
-    # 使用 ContinuousCallback 来实现当 P < 1e-8 时终止积分
+    # 定义终止条件：当压力 P (u[2]) 小于 1e-8 时终止积分
     condition(u, t, integrator) = u[2] - 1e-8
     affect!(integrator) = terminate!(integrator)
     cb = ContinuousCallback(condition, affect!)
@@ -68,7 +66,7 @@ function solve_TOV(P_c)
     return sol
 end
 
-# 根据中心压力 P_c 计算中子星的半径 R 和质量 M
+# 根据中心压力 P_c 计算中子星的半径 R 和总质量 M
 function compute_star(P_c)
     sol = solve_TOV(P_c)
     R = sol.t[end]           # 积分终止时的半径，即中子星半径
@@ -141,22 +139,21 @@ function magnetic_correction(r, β, B0; R_star=10.0)
     return β * dipole_field(r, π/2, B0; R_star=R_star)
 end
 
-# 定义耦合 TOV 方程：
+# 定义耦合 TOV 方程：函数签名为 f(du, u, p, t)
 # 在原 TOV 方程 dP/dr 基础上增加磁场修正项 ΔB(r)
-function TOV_coupled!(du, u, r, params)
-    β, B0 = params
+function TOV_coupled!(du, u, p, t)
+    β, B0 = p
     m, P = u
-    if r < 1e-6
+    if t < 1e-6
         du[1] = 0.0
         du[2] = 0.0
         return
     end
     ρ = ρ_of_P(P)
     ε = ρ
-    dm_dr = 4π * r^2 * ε
-    ΔB = magnetic_correction(r, β, B0)
-    # 修正 dP/dr：原公式加上磁场修正项
-    dP_dr = -((ε + P) * (m + 4π * r^3 * P)) / (r * (r - 2 * m)) + ΔB
+    dm_dr = 4π * t^2 * ε
+    ΔB = magnetic_correction(t, β, B0)
+    dP_dr = -((ε + P) * (m + 4π * t^3 * P)) / (t * (t - 2 * m)) + ΔB
     du[1] = dm_dr
     du[2] = dP_dr
 end
@@ -169,7 +166,7 @@ function solve_TOV_coupled(P_c, β, B0)
     params = (β, B0)
     prob = ODEProblem(TOV_coupled!, u0, (r0, 20.0), params)
     
-    # 同样使用 ContinuousCallback 来停止积分
+    # 使用 ContinuousCallback 来终止积分，当 P < 1e-8 时终止
     condition(u, t, integrator) = u[2] - 1e-8
     affect!(integrator) = terminate!(integrator)
     cb = ContinuousCallback(condition, affect!)
