@@ -8,8 +8,6 @@
 # 1. TOV Equation Solver with a complex, piecewise polytropic EOS.
 # 2. Dipole Magnetic Field Distribution Calculation.
 # 3. Coupled Model: Incorporates a magnetic correction term in the TOV equation.
-# 4. Magnetic Field Evolution Model: A 1D diffusion model with a spatially-varying
-#    diffusion coefficient.
 #
 # Dependencies: DifferentialEquations.jl, Plots.jl, LinearAlgebra, StaticArrays
 ################################################################################
@@ -32,7 +30,7 @@ const K2 = 500.0      # Polytropic constant for high density
 const γ2 = 2.5        # Polytropic exponent for high density
 const P_transition = 1e2  # Transition pressure
 
-# EOS function: Given density ρ, return pressure P
+# EOS function: Given density ρ, return pressure P.
 function eos(ρ)
     if ρ < 1e-3
         return K1 * ρ^γ1
@@ -42,7 +40,7 @@ function eos(ρ)
 end
 
 # Inverse EOS: Given pressure P, compute density ρ.
-# To avoid complex values when P is slightly negative, we use max(P, 0).
+# To avoid complex values when P is slightly negative, we use max(P, 0.0)
 function ρ_of_P(P)
     P_eff = max(P, 0.0)
     if P_eff < P_transition
@@ -55,9 +53,10 @@ end
 # TOV equation in in-place form:
 #   dm/dr = 4π r^2 ε, where ε ≈ ρ(P)
 #   dP/dr = - ((ε + P) (m + 4π r^3 P)) / (r (r - 2m))
+# Function signature: f(du, u, p, t)
 function TOV!(du, u, p, t)
     m, P = u
-    # t is the radial coordinate r.
+    # t represents the radial coordinate r.
     if t < 1e-6
         du[1] = 0.0
         du[2] = 0.0
@@ -73,27 +72,27 @@ end
 
 # Solve TOV equations for a given central pressure P_c.
 function solve_TOV(P_c)
-    r0 = 1e-3      # Starting radius to avoid singularity at r=0.
+    r0 = 1e-3      # Starting radius; increased to avoid extreme gradients near r=0.
     m0 = 0.0
     u0 = [m0, P_c]
+    # Create ODEProblem without passing extra parameters.
     prob = ODEProblem(TOV!, u0, (r0, 20.0))
     
-    # Define a continuous callback to stop integration when pressure falls below 1e-8.
+    # Define a continuous callback to terminate integration when pressure P < 1e-8.
     condition(u, t, integrator) = u[2] - 1e-8
     affect!(integrator) = terminate!(integrator)
     cb = ContinuousCallback(condition, affect!)
     
-    
-    sol = solve(prob, Rosenbrock23(), reltol=1e-5, abstol=1e-7, callback=cb)
+    # Use a stiff solver and relaxed tolerances; increase maxiters to allow more iterations.
+    sol = solve(prob, Rosenbrock23(), reltol=1e-5, abstol=1e-7, callback=cb, maxiters=1e7)
     return sol
-
 end
 
 # Compute the star's radius and mass given a central pressure P_c.
 function compute_star(P_c)
     sol = solve_TOV(P_c)
-    R = sol.t[end]
-    M = sol.u[end][1]
+    R = sol.t[end]           # Final time value as the star's radius.
+    M = sol.u[end][1]        # Total mass.
     return R, M
 end
 
@@ -180,19 +179,18 @@ end
 
 # Solve the coupled TOV equations with a given central pressure, coupling parameter β, and B0.
 function solve_TOV_coupled(P_c, β, B0)
-    r0 = 1e-6
+    r0 = 1e-3
     m0 = 0.0
     u0 = [m0, P_c]
     params = (β, B0)
     prob = ODEProblem(TOV_coupled!, u0, (r0, 20.0), params)
     
-    # Use a ContinuousCallback to stop integration when pressure < 1e-8.
+    # Use a ContinuousCallback to terminate integration when pressure < 1e-8.
     condition(u, t, integrator) = u[2] - 1e-8
     affect!(integrator) = terminate!(integrator)
     cb = ContinuousCallback(condition, affect!)
     
-
-    sol = solve(prob, Rosenbrock23(), reltol=1e-5, abstol=1e-7, callback=cb)
+    sol = solve(prob, Rosenbrock23(), reltol=1e-5, abstol=1e-7, callback=cb, maxiters=1e7)
     return sol
 end
 
