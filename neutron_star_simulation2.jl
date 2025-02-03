@@ -84,7 +84,7 @@ function solve_TOV(P_c)
     cb = ContinuousCallback(condition, affect!)
     
     # Use a stiff solver and relaxed tolerances; increase maxiters to allow more iterations.
-    sol = solve(prob, Rodas5(), reltol=1e-5, abstol=1e-7, callback=cb, maxiters=1e7)
+    sol = solve(prob, Rodas5(), reltol=1e-4, abstol=1e-6, callback=cb, maxiters=1e7)
     return sol
 end
 
@@ -190,7 +190,7 @@ function solve_TOV_coupled(P_c, β, B0)
     affect!(integrator) = terminate!(integrator)
     cb = ContinuousCallback(condition, affect!)
     
-    sol = solve(prob, Rodas5(), reltol=1e-5, abstol=1e-7, callback=cb, maxiters=1e7)
+    sol = solve(prob, Rodas5(), reltol=1e-4, abstol=1e-6, callback=cb, maxiters=1e7)
     return sol
 end
 
