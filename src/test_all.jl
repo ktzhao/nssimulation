@@ -111,11 +111,14 @@ end
     function create_dummy_field(val)
         return fill(val, nx + 2 * ghost[1], ny + 2 * ghost[2], nz + 2 * ghost[3])
     end
+
     # 创建两个物理场：density 和 pressure
     local_fields = Dict(:density => create_dummy_field(1.0), :pressure => create_dummy_field(2.0))
     # 将 local_fields 设置为全局变量（模拟各 worker 上的情况）
-    Main.local_fields = local_fields
 
+    global Main.local_fields
+    Main.local_fields = local_fields
+    
     # 调用 ghost_exchange_3d_batch!（此处仅为示例，测试环境中可能不进行实际远程通信）
     updated_fields = ghost_exchange_3d_batch!(local_fields, domains[1]; timeout = 2.0)
     @test isa(updated_fields, Dict)

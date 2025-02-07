@@ -159,6 +159,8 @@ const opposites = Dict(:left=>:right, :right=>:left,
 """
 function ghost_exchange_3d_batch!(field_dict::Dict{Symbol,Array{Float64,3}}, domain; timeout::Float64=5.0)
     # 设置本地全局变量 local_fields，供远程调用使用
+ 
+
     Main.local_fields = field_dict
 
     start_time = time()
