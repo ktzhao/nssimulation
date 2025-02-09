@@ -19,11 +19,15 @@ using Distributed
 using LinearAlgebra
 using CUDA
 using Dates
+using Base.Threads: Atomic, atomic_add!
+
+export async_gpu_exchange, async_mixed_communication, create_sync_channel,
+       async_workflow_with_sync, parallel_workflow_with_tuning, get_parallel_performance_report,
+       advanced_async_communication
 
 # ------------------------------
 # 性能调优接口
 # ------------------------------
-# 存储全局并行参数，允许用户动态调整
 const parallel_params = Dict{Symbol,Any}(
     :comm_buffer_size => 1024,   # 通信缓冲区大小（字节数）
     :comm_interval => 0.1,       # 通信间隔（秒）
@@ -52,16 +56,14 @@ end
 """
 function async_gpu_exchange(data::Array{Float64}, device_id::Int)
     if !CUDA.has_cuda()
-        error("GPU 不可用！")
+        @warn "GPU 不可用！"
+        return nothing
     end
     fut = @async begin
         try
             CUDA.device!(device_id)
-            # 将数据传输到 GPU
             d_data = CuArray(data)
-            # 模拟计算：例如计算平方（实际可替换为更复杂的物理计算）
-            d_result = d_data .^ 2
-            # 将结果传回 CPU
+            d_result = d_data .^ 2  # 示例计算
             result = Array(d_result)
             return result
         catch e
@@ -118,7 +120,6 @@ end
 # ------------------------------
 # 容错与自恢复机制
 # ------------------------------
-# 全局检查点存储（简单示例）
 const checkpoint_storage = Dict{Int,Any}()
 
 """
@@ -161,15 +162,13 @@ end
 # ------------------------------
 # 异步工作流与任务调度：容错、超时与性能统计
 # ------------------------------
-# 全局通信统计信息（原子更新，简单示例）
 const comm_stats = Dict{Symbol,Any}(
-    :total_time => 0.0,
-    :total_bytes => 0,
-    :calls => 0,
-    :errors => 0,
+    :total_time  => Atomic{Float64}(0.0),
+    :total_bytes => Atomic{Int64}(0),
+    :calls       => Atomic{Int64}(0),
+    :errors      => Atomic{Int64}(0),
 )
 
-# 辅助函数：计算数组字节大小
 function array_size_bytes(arr::AbstractArray)
     return sizeof(eltype(arr)) * length(arr)
 end
@@ -177,14 +176,14 @@ end
 """
     call_with_timeout(f::Function, timeout::Float64) -> Any
 
-运行函数 f，并在 timeout 秒内等待完成，超时则取消任务并抛出异常。
+运行函数 f，并在 timeout 秒内等待完成，超时则抛出异常。
+（注意：已移除 fut.cancel()，因为 Task 对象没有 cancel 方法。）
 """
 function call_with_timeout(f::Function, timeout::Float64)
     fut = @async f()
     t0 = time()
     while !istaskdone(fut)
         if (time() - t0) > timeout
-            fut.cancel()
             throw(InterruptException("Operation timed out after $timeout seconds"))
         end
         sleep(0.01)
@@ -206,13 +205,12 @@ function advanced_async_communication(data::Array{Float64}, device_id::Int)
     total_bytes = 0
     gpu_future = @async begin
         try
-            # 包装 GPU 任务，设置超时为 parallel_params[:comm_interval]
-            result = call_with_timeout(() -> async_gpu_exchange(data, device_id) |> fetch, parallel_params[:comm_interval])
+            result = call_with_timeout(() -> fetch(async_gpu_exchange(data, device_id)), parallel_params[:comm_interval])
             total_bytes += array_size_bytes(result)
             return result
         catch e
             @warn "GPU任务错误或超时: $e"
-            Threads.atomic_add!(comm_stats[:errors], 1)
+            atomic_add!(comm_stats[:errors], 1)
             return nothing
         end
     end
@@ -223,7 +221,7 @@ function advanced_async_communication(data::Array{Float64}, device_id::Int)
             return result
         catch e
             @warn "CPU任务错误或超时: $e"
-            Threads.atomic_add!(comm_stats[:errors], 1)
+            atomic_add!(comm_stats[:errors], 1)
             return nothing
         end
     end
@@ -231,9 +229,9 @@ function advanced_async_communication(data::Array{Float64}, device_id::Int)
         gpu_result = fetch(gpu_future)
         cpu_result = fetch(cpu_future)
         elapsed = time() - start_time
-        Threads.atomic_add!(comm_stats[:total_time], elapsed)
-        Threads.atomic_add!(comm_stats[:total_bytes], total_bytes)
-        Threads.atomic_add!(comm_stats[:calls], 1)
+        atomic_add!(comm_stats[:total_time], elapsed)
+        atomic_add!(comm_stats[:total_bytes], total_bytes)
+        atomic_add!(comm_stats[:calls], 1)
         return (gpu_result, cpu_result)
     end
     return combined_future
@@ -246,13 +244,12 @@ end
 并支持容错恢复。返回通信任务结果。
 """
 function parallel_workflow_with_tuning(data::Array{Float64}, device_id::Int, sync_channel::RemoteChannel)
-    # 调度高级异步通信任务
-    future_task = advanced_async_communication(data, device_id)
+    future_task = async_mixed_communication(data, device_id)
     result = try
         fetch(future_task)
     catch e
         @warn "任务失败，尝试恢复: $e"
-        recover_communication(device_id, () -> fetch(advanced_async_communication(data, device_id)))
+        result = fetch(async_mixed_communication(data, device_id))
     end
     put!(sync_channel, result)
     return result
@@ -264,7 +261,12 @@ end
 返回当前并行通信统计信息，包括总通信时间、传输字节、调用次数、错误次数等。
 """
 function get_parallel_performance_report()
-    return deepcopy(comm_stats)
+    return Dict(
+       :total_time  => comm_stats[:total_time].value,
+       :total_bytes => comm_stats[:total_bytes].value,
+       :calls       => comm_stats[:calls].value,
+       :errors      => comm_stats[:errors].value,
+    )
 end
 
 end  # module AdvancedParallel

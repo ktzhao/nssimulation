@@ -18,7 +18,8 @@ module DomainDecomposition
 
 using Distributed
 using LinearAlgebra
-using Main.GridModule  # 修改为绝对引用，从 Main 中加载 GridModule
+using Main.GridModule
+ # 修改为绝对引用，从 Main 中加载 GridModule
 
 export Domain3D, decompose_grid_3d, reconstruct_decomposition, multi_level_decompose,
        get_local_grid, update_decomposition_with_load
