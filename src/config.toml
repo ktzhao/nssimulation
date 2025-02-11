@@ -1,0 +1,17 @@
+[K]
+value = 1.0
+
+[gamma]
+value = 2.0
+
+[T]
+value = 0.0
+
+[r_end]
+value = 20.0
+
+[solver]
+type = "Rosenbrock23"
+
+[checkpoint]
+interval = 100
