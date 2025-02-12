@@ -1,93 +1,135 @@
 module GRMHDModule
 
 using LinearAlgebra
-using SpecialFunctions
-using DifferentialEquations
+using Main.GridModule
+using Main.EOSModule
+using Main.TOVSolver
 
-export GRMHDState, solve_grmhd, grmhd_flux, apply_riemann_solver, apply_weno_solver, divergence_cleaning
+export evolve_grmhd, compute_grmhd_fluxes, update_grmhd_fields
 
-# 物理状态结构体
-struct GRMHDState
-    ρ::Vector{Float64}       # 质量密度
-    u::Vector{Vector{Float64}} # 动量密度，u^i 方向数组
-    e::Vector{Float64}       # 能量密度
-    B::Vector{Vector{Float64}} # 磁场分量，B^i 方向数组
-end
+# --------------------------
+# 求解GRMHD方程的核心函数
+# --------------------------
 
-# GRMHD 方程组（理想流体+电磁场模型）
+"""
+    evolve_grmhd(grid::Grid, eos::FiniteTempEOS, dt::Float64)
 
-# 质量守恒：dρ/dt + ∇⋅(ρ u^i) = 0
-# 动量守恒：du^i/dt + ∇⋅(ρ u^i u^j + p δ^i_j - B^i B^j) = 0
-# 能量守恒：de/dt + ∇⋅[(e + p) u^i - B^i B^j + F^i] = 0
-# 磁场方程：∂_t B^i = ∇_j (B^j u^i) + η ∇^2 B^i
-
-# 高分辨率震荡捕捉方法（例如WENO）
-function apply_weno_solver(flux_ρ, flux_momentum, flux_energy, flux_B)
-    # 假设WENO方法已经实现，可以替换Riemann方法
-    flux_ρ_new = weno_scheme(flux_ρ)
-    flux_momentum_new = weno_scheme(flux_momentum)
-    flux_energy_new = weno_scheme(flux_energy)
-    flux_B_new = weno_scheme(flux_B)
-    
-    return flux_ρ_new, flux_momentum_new, flux_energy_new, flux_B_new
-end
-
-# WENO数值解法的简化实现，实际应用时需要更复杂的WENO方案
-function weno_scheme(flux)
-    # 简化的WENO方案（实际需要实现具体的WENO方法）
-    return flux * 0.5  # 这里只是示意，实际需要根据物理方程进行调整
-end
-
-# 求解GRMHD方程组
-function grmhd_flux(state::GRMHDState, dx::Float64, dt::Float64)
-    ρ, u, e, B = state.ρ, state.u, state.e, state.B
-    
-    # 质量守恒通量
-    flux_ρ = [ρ[i] * u[i] for i in 1:length(ρ)]
-    
-    # 动量守恒通量
-    flux_momentum = [ρ[i] * u[i] * u[j] + e * δ(i, j) - B[i] * B[j] for i in 1:length(ρ), j in 1:length(ρ)]
-    
-    # 能量守恒通量
-    flux_energy = [(e + ρ[i]) * u[i] - B[i] * B[j] for i in 1:length(ρ), j in 1:length(ρ)]
-    
-    # 磁场通量（采用有限体积法）
-    flux_B = [B[i] * u[j] - B[j] * u[i] for i in 1:length(ρ), j in 1:length(ρ)]
-    
-    return flux_ρ, flux_momentum, flux_energy, flux_B
-end
-
-# 磁场散度清除方法
-function divergence_cleaning(state::GRMHDState)
-    # 假设B^i已经在state中
-    B_div = sum([state.B[i][i] for i in 1:length(state.B)])  # 磁场的散度
-    corrected_B = [state.B[i] - B_div for i in 1:length(state.B)]
-    
-    return GRMHDState(state.ρ, state.u, state.e, corrected_B)
-end
-
-# 求解GRMHD方程
-function solve_grmhd(state::GRMHDState, dx::Float64, dt::Float64)
-    # 计算通量
-    flux_ρ, flux_momentum, flux_energy, flux_B = grmhd_flux(state, dx, dt)
-    
-    # 使用WENO求解器进行震荡捕捉
-    flux_ρ_new, flux_momentum_new, flux_energy_new, flux_B_new = apply_weno_solver(flux_ρ, flux_momentum, flux_energy, flux_B)
-    
-    # 更新状态变量（质量、动量、能量、磁场等）
-    state.ρ .+= dt * flux_ρ_new
-    for i in 1:length(state.u)
-        state.u[i] .+= dt * flux_momentum_new[i]
+该函数用于演化GRMHD方程，在每个时间步长更新磁场、密度、温度等物理量。
+"""
+function evolve_grmhd(grid::Grid, eos::FiniteTempEOS, dt::Float64)
+    for i in 1:length(grid.coordinates[:x])
+        rho = grid.physical_fields[:density][i]
+        T = grid.physical_fields[:temperature][i]
+        P = eos.pressure(rho, T)
+        
+        # 根据压力和温度更新磁场
+        B = compute_magnetic_field(rho, T, P, eos)
+        
+        # 更新GRMHD方程中的其他物理量
+        # 例如计算电流密度、能量流等
+        J = compute_current_density(grid, eos)
+        flux = compute_grmhd_fluxes(grid, eos)
+        
+        # 根据GRMHD方程演化密度、温度、磁场等
+        update_grmhd_fields!(grid, eos, dt, B, J, flux)
     end
-    state.e .+= dt * flux_energy_new
-    for i in 1:length(state.B)
-        state.B[i] .+= dt * flux_B_new[i]
-    end
-    
-    # 磁场散度清除
-    state = divergence_cleaning(state)
-    
-    return state
 end
 
-end  # module GRMHDModule
+# --------------------------
+# 磁场和电流密度计算
+# --------------------------
+
+"""
+    compute_magnetic_field(rho::Float64, T::Float64, P::Float64, eos::FiniteTempEOS)
+
+该函数用于计算磁场强度，假设磁场和温度、密度等物理量相关。
+"""
+function compute_magnetic_field(rho::Float64, T::Float64, P::Float64, eos::FiniteTempEOS)
+    # 假设磁场强度与温度和密度的关系
+    B = eos.magnetic_strength_factor * (rho^0.5) * (T^0.25)
+    return B
+end
+
+"""
+    compute_current_density(grid::Grid, eos::FiniteTempEOS)
+
+计算电流密度，该函数可以结合电场和温度分布来计算
+"""
+function compute_current_density(grid::Grid, eos::FiniteTempEOS)
+    # 这里只是一个示例，具体可以根据物理模型修改
+    J = zeros(Float64, length(grid.coordinates[:x]))
+    for i in 1:length(grid.coordinates[:x])
+        T = grid.physical_fields[:temperature][i]
+        J[i] = eos.current_density_factor * T^2
+    end
+    return J
+end
+
+# --------------------------
+# GRMHD方程的演化
+# --------------------------
+
+"""
+    compute_grmhd_fluxes(grid::Grid, eos::FiniteTempEOS)
+
+该函数计算GRMHD方程中的能量和动量通量。
+"""
+function compute_grmhd_fluxes(grid::Grid, eos::FiniteTempEOS)
+    flux = Dict()
+    
+    # 计算动量和能量通量，这里只给出示例
+    flux[:momentum] = zeros(Float64, length(grid.coordinates[:x]))
+    flux[:energy] = zeros(Float64, length(grid.coordinates[:x]))
+    
+    for i in 1:length(grid.coordinates[:x])
+        rho = grid.physical_fields[:density][i]
+        T = grid.physical_fields[:temperature][i]
+        P = eos.pressure(rho, T)
+        
+        # 假设通量与密度和压力相关
+        flux[:momentum][i] = rho * eos.velocity_factor * (P/rho)
+        flux[:energy][i] = P + 0.5 * rho * eos.velocity_factor^2  # 只为示例
+    end
+    
+    return flux
+end
+
+"""
+    update_grmhd_fields!(grid::Grid, eos::FiniteTempEOS, dt::Float64, B::Vector{Float64}, J::Vector{Float64}, flux::Dict)
+
+根据GRMHD方程更新物理场（磁场、电流密度、动量、能量等）。
+"""
+function update_grmhd_fields!(grid::Grid, eos::FiniteTempEOS, dt::Float64, B::Vector{Float64}, J::Vector{Float64}, flux::Dict)
+    # 更新磁场、电流密度等
+    for i in 1:length(grid.coordinates[:x])
+        grid.physical_fields[:magnetic_field][i] += B[i] * dt
+        grid.physical_fields[:current_density][i] += J[i] * dt
+        grid.physical_fields[:density][i] += flux[:momentum][i] * dt
+        grid.physical_fields[:temperature][i] += flux[:energy][i] * dt
+    end
+end
+
+# --------------------------
+# 辅助函数与调度
+# --------------------------
+
+"""
+    adaptive_grmhd_refinement(grid::Grid, eos::FiniteTempEOS, threshold::Float64)
+
+根据物理量的变化情况进行网格细化，自动选择细化区域
+"""
+function adaptive_grmhd_refinement(grid::Grid, eos::FiniteTempEOS, threshold::Float64)
+    # 计算每个位置的物理量变化
+    for i in 2:length(grid.coordinates[:x]) - 1
+        pressure_gradient = abs(grid.physical_fields[:pressure][i] - grid.physical_fields[:pressure][i-1])
+        temperature_gradient = abs(grid.physical_fields[:temperature][i] - grid.physical_fields[:temperature][i-1])
+        
+        # 判断是否需要细化
+        if pressure_gradient > threshold || temperature_gradient > threshold
+            refine_grid_combined!(grid, :pressure, 0.1, 1.0e8, eos)  # 细化网格
+            refine_grid_combined!(grid, :temperature, 0.05, 1.0e9, eos)  # 细化温度网格
+        end
+    end
+end
+
+end # module GRMHDModule

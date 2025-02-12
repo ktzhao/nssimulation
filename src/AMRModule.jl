@@ -3,7 +3,9 @@ module AMRModule
 using LinearAlgebra
 using CUDA
 
-export AdaptiveMeshRefinement, refine_grid, compute_gradient, adaptive_timestep
+export AdaptiveMeshRefinement, refine_grid, refine_grid_by_value!, compute_gradient,
+       adaptive_timestep, refine_grid_gpu!, compute_gradient_gpu, compute_gradient_kernel,
+       adaptive_eos_coupling, refine_grid_combined!
 
 # --------------------------
 # 自适应网格细化 (AMR)
@@ -22,6 +24,7 @@ mutable struct AdaptiveMeshRefinement
     spacing::Float64
     coordinates::Dict{Symbol, Array{Float64, 1}}   # 用于存储不同维度的网格坐标
     physical_fields::Dict{Symbol, Array{Float64, 1}} # 存储物理场，如密度、温度、压力等
+    current_refinement_level::Int  # 当前网格细化级别
 end
 
 # --------------------------
@@ -29,11 +32,11 @@ end
 # --------------------------
 
 """
-    refine_grid!(amr::AdaptiveMeshRefinement, field::Symbol)
+    refine_grid!(amr::AdaptiveMeshRefinement, field::Symbol, eos::FiniteTempEOS)
 
-根据物理场的梯度自动细化网格。在区域梯度变化剧烈的地方使用更精细的网格。
+根据物理场的梯度自动细化网格，并根据网格细化级别动态调整EOS。
 """
-function refine_grid!(amr::AdaptiveMeshRefinement, field::Symbol)
+function refine_grid!(amr::AdaptiveMeshRefinement, field::Symbol, eos::FiniteTempEOS)
     # 计算物理场的梯度
     gradient = compute_gradient(amr, field)
 
@@ -42,13 +45,48 @@ function refine_grid!(amr::AdaptiveMeshRefinement, field::Symbol)
         if gradient[i] > amr.refinement_threshold
             # 对需要细化的区域增加网格密度
             amr.grid_size += 1
+            amr.current_refinement_level = min(amr.current_refinement_level + 1, amr.max_refinement_level)
             println("在第 $(i) 位置细化网格")
         elseif gradient[i] < amr.refinement_threshold / 2
             # 对变化较小的区域减少网格密度
             amr.grid_size = max(amr.grid_size - 1, amr.min_refinement_level)
+            amr.current_refinement_level = max(amr.current_refinement_level - 1, amr.min_refinement_level)
             println("在第 $(i) 位置粗化网格")
         end
     end
+
+    # 根据当前网格细化级别调整EOS
+    adaptive_eos_coupling(amr, eos)
+end
+
+# --------------------------
+# 根据物理场值细化网格
+# --------------------------
+
+"""
+    refine_grid_by_value!(amr::AdaptiveMeshRefinement, field::Symbol, threshold::Float64, eos::FiniteTempEOS)
+
+根据物理场的值自动细化网格，依据物理量的绝对值进行细化。
+"""
+function refine_grid_by_value!(amr::AdaptiveMeshRefinement, field::Symbol, threshold::Float64, eos::FiniteTempEOS)
+    field_data = amr.physical_fields[field]
+
+    for i in 1:length(field_data)
+        if field_data[i] > threshold
+            # 对物理场值超过阈值的区域增加网格密度
+            amr.grid_size += 1
+            amr.current_refinement_level = min(amr.current_refinement_level + 1, amr.max_refinement_level)
+            println("在第 $(i) 位置细化网格，物理场值超过阈值")
+        elseif field_data[i] < threshold / 2
+            # 对物理场值较低的区域减少网格密度
+            amr.grid_size = max(amr.grid_size - 1, amr.min_refinement_level)
+            amr.current_refinement_level = max(amr.current_refinement_level - 1, amr.min_refinement_level)
+            println("在第 $(i) 位置粗化网格，物理场值低于阈值")
+        end
+    end
+
+    # 根据当前网格细化级别调整EOS
+    adaptive_eos_coupling(amr, eos)
 end
 
 # --------------------------
@@ -77,11 +115,11 @@ end
 # --------------------------
 
 """
-    adaptive_timestep!(amr::AdaptiveMeshRefinement, dt::Float64)
+    adaptive_timestep!(amr::AdaptiveMeshRefinement, dt::Float64, eos::FiniteTempEOS)
 
 根据物理场的梯度和网格大小自动调整时间步长。
 """
-function adaptive_timestep!(amr::AdaptiveMeshRefinement, dt::Float64)
+function adaptive_timestep!(amr::AdaptiveMeshRefinement, dt::Float64, eos::FiniteTempEOS)
     # 计算物理场的梯度
     gradient = compute_gradient(amr, :temperature)
 
@@ -89,6 +127,9 @@ function adaptive_timestep!(amr::AdaptiveMeshRefinement, dt::Float64)
     max_gradient = maximum(abs.(gradient))
     dt_adjustment_factor = 1.0 / (1.0 + max_gradient)  # 较大梯度区域，时间步长较小
     new_dt = dt * dt_adjustment_factor
+
+    # 根据当前网格细化级别调整时间步长
+    new_dt *= 2.0^(amr.current_refinement_level - 1)
 
     return new_dt
 end
@@ -98,11 +139,11 @@ end
 # --------------------------
 
 """
-    refine_grid_gpu!(amr::AdaptiveMeshRefinement, field::Symbol)
+    refine_grid_gpu!(amr::AdaptiveMeshRefinement, field::Symbol, eos::FiniteTempEOS)
 
-GPU加速版本的网格细化函数，利用CUDA加速梯度计算和网格细化过程。
+GPU加速版本的网格细化函数，利用CUDA加速梯度计算和网格细化过程，并根据细化级别调整EOS。
 """
-function refine_grid_gpu!(amr::AdaptiveMeshRefinement, field::Symbol)
+function refine_grid_gpu!(amr::AdaptiveMeshRefinement, field::Symbol, eos::FiniteTempEOS)
     # 计算物理场的梯度
     gradient = compute_gradient_gpu(amr, field)
 
@@ -111,13 +152,18 @@ function refine_grid_gpu!(amr::AdaptiveMeshRefinement, field::Symbol)
         if gradient[i] > amr.refinement_threshold
             # 对需要细化的区域增加网格密度
             amr.grid_size += 1
+            amr.current_refinement_level = min(amr.current_refinement_level + 1, amr.max_refinement_level)
             println("在第 $(i) 位置细化网格 (GPU加速)")
         elseif gradient[i] < amr.refinement_threshold / 2
             # 对变化较小的区域减少网格密度
             amr.grid_size = max(amr.grid_size - 1, amr.min_refinement_level)
+            amr.current_refinement_level = max(amr.current_refinement_level - 1, amr.min_refinement_level)
             println("在第 $(i) 位置粗化网格 (GPU加速)")
         end
     end
+
+    # 根据当前网格细化级别调整EOS
+    adaptive_eos_coupling(amr, eos)
 end
 
 """
@@ -147,4 +193,63 @@ function compute_gradient_kernel(field_data, gradient, spacing)
     end
 end
 
-end # module AMRModule
+# --------------------------
+# 自适应EOS耦合
+# --------------------------
+
+"""
+    adaptive_eos_coupling(amr::AdaptiveMeshRefinement, eos::FiniteTempEOS)
+
+根据当前网格细化级别动态调整EOS参数。
+"""
+function adaptive_eos_coupling(amr::AdaptiveMeshRefinement, eos::FiniteTempEOS)
+    if amr.current_refinement_level > 5
+        # 在更高的网格细化级别使用更精细的EOS
+        eos.gamma = 2.5
+        eos.K = 1.5
+        println("在细化级别 $(amr.current_refinement_level) 使用更精细的EOS")
+    elseif amr.current_refinement_level > 3
+        # 中等细化级别
+        eos.gamma = 2.2
+        eos.K = 1.2
+        println("在细化级别 $(amr.current_refinement_level) 使用中等精度的EOS")
+    else
+        # 粗网格使用较粗的EOS
+        eos.gamma = 2.0
+        eos.K = 1.0
+        println("在细化级别 $(amr.current_refinement_level) 使用粗网格的EOS")
+    end
+end
+
+# --------------------------
+# 结合梯度和物理场值的细化
+# --------------------------
+
+"""
+    refine_grid_combined!(amr::AdaptiveMeshRefinement, field::Symbol, gradient_threshold::Float64, value_threshold::Float64, eos::FiniteTempEOS)
+
+结合梯度和物理场值进行网格细化，在两个标准都满足的情况下细化网格。
+"""
+function refine_grid_combined!(amr::AdaptiveMeshRefinement, field::Symbol, gradient_threshold::Float64, value_threshold::Float64, eos::FiniteTempEOS)
+    gradient = compute_gradient(amr, field)
+    field_data = amr.physical_fields[field]
+
+    for i in 1:length(gradient)
+        if gradient[i] > gradient_threshold && field_data[i] > value_threshold
+            # 对梯度和物理场值都满足条件的区域进行细化
+            amr.grid_size += 1
+            amr.current_refinement_level = min(amr.current_refinement_level + 1, amr.max_refinement_level)
+            println("在第 $(i) 位置细化网格，梯度和物理场值均满足条件")
+        elseif gradient[i] < gradient_threshold / 2 && field_data[i] < value_threshold / 2
+            # 对梯度和物理场值均较小的区域进行粗化
+            amr.grid_size = max(amr.grid_size - 1, amr.min_refinement_level)
+            amr.current_refinement_level = max(amr.current_refinement_level - 1, amr.min_refinement_level)
+            println("在第 $(i) 位置粗化网格，梯度和物理场值均较低")
+        end
+    end
+
+    # 根据当前网格细化级别调整EOS
+    adaptive_eos_coupling(amr, eos)
+end
+
+end  # module AMRModule

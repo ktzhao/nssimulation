@@ -3,8 +3,9 @@ module TOVSolver
 using LinearAlgebra
 using DifferentialEquations
 using Main.GridModule
+using Main.EOSModule
 
-export solve_tov, compute_observables, evolve_temperature!, update_temperature
+export solve_tov, compute_observables, evolve_temperature!, update_temperature, adaptive_eos_coupling, solve_tov_with_multiscale
 
 # 物理常数与辅助函数
 const G = 6.67430e-11  # 引力常数 (m^3 kg^-1 s^-2)
@@ -20,14 +21,29 @@ const c = 3.0e8        # 光速 (m/s)
 该函数用于求解TOV方程，计算恒星内部的质量、半径、压力和密度。
 """
 function solve_tov(Pc; K=1.0, gamma=2.0, T=1.0e6, eos, r_end=20.0, tol=1e-8, solver=:Rosenbrock23)
-    # 设置EOS模型
     eos.T0 = T
     eos.K = K
     eos.gamma = gamma
-    
+
     # 初始状态，使用初始压力Pc来推导密度和温度
     rho_initial = eos.density(Pc, T)
     
+    # 在求解之前进行网格细化
+    amr = AdaptiveMeshRefinement(
+        grid_size=10,
+        max_refinement_level=5,
+        min_refinement_level=2,
+        refinement_threshold=0.1,
+        spacing=1.0,
+        coordinates=Dict(:x => LinRange(0, r_end, 100)),
+        physical_fields=Dict(:temperature => zeros(100), :pressure => zeros(100)),
+        current_refinement_level=1
+    )
+    
+    # 细化网格：基于压力和温度进行细化
+    refine_grid_combined!(amr, :pressure, 0.1, 1.0e8, eos)  # Example: refine based on pressure
+    refine_grid_combined!(amr, :temperature, 0.05, 1.0e9, eos)  # Example: refine based on temperature
+
     # 时间步长和求解器
     t_start = 0.0
     r = LinRange(0.1, r_end, 100)  # 半径的分布
@@ -106,11 +122,11 @@ end
 # --------------------------
 
 """
-    adaptive_eos_coupling(r::Vector{Float64}, eos::FiniteTempEOS, region::Symbol)
+    adaptive_eos_coupling(r::Vector{Float64}, eos::FiniteTempEOS, region::Symbol, current_refinement_level::Int)
 
 根据物理区域自动选择不同的耦合策略，例如在高温、高密度区域使用更精确的模型。
 """
-function adaptive_eos_coupling(r::Vector{Float64}, eos::FiniteTempEOS, region::Symbol)
+function adaptive_eos_coupling(r::Vector{Float64}, eos::FiniteTempEOS, region::Symbol, current_refinement_level::Int)
     if region == :high_temperature
         println("在高温区域使用更精细的EOS耦合")
         eos.gamma = 2.5  # 更高的伽马值，适应高温区域
@@ -122,6 +138,21 @@ function adaptive_eos_coupling(r::Vector{Float64}, eos::FiniteTempEOS, region::S
         eos.gamma = 2.0  # 默认伽马值
         eos.K = 1.0      # 默认K值
     end
+
+    # 根据当前网格细化级别动态调整EOS
+    if current_refinement_level > 5
+        eos.gamma = 2.5
+        eos.K = 1.5
+        println("在细化级别 $(current_refinement_level) 使用更精细的EOS")
+    elseif current_refinement_level > 3
+        eos.gamma = 2.2
+        eos.K = 1.2
+        println("在细化级别 $(current_refinement_level) 使用中等精度的EOS")
+    else
+        eos.gamma = 2.0
+        eos.K = 1.0
+        println("在细化级别 $(current_refinement_level) 使用粗网格的EOS")
+    end
 end
 
 """
@@ -130,7 +161,6 @@ end
 基于多尺度建模，自动选择不同的尺度计算方式。
 """
 function solve_tov_with_multiscale(Pc; K=1.0, gamma=2.0, T=1.0e6, eos, r_end=20.0, tol=1e-8, solver=:Rosenbrock23)
-    # 设置EOS模型
     eos.T0 = T
     eos.K = K
     eos.gamma = gamma
@@ -156,7 +186,7 @@ function solve_tov_with_multiscale(Pc; K=1.0, gamma=2.0, T=1.0e6, eos, r_end=20.
     for i in 2:length(r)
         # 根据位置动态调整EOS耦合策略
         region = get_region(r[i], eos)
-        adaptive_eos_coupling(r, eos, region)
+        adaptive_eos_coupling(r, eos, region, 3)  # 假设当前细化级别是3
 
         # 更新温度、密度、压力等物理量
         temperature[i] = update_temperature(pressure[i-1], eos, density[i-1], temperature[i-1])

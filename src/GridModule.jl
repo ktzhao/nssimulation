@@ -7,10 +7,12 @@ using YAML
 
 # 引入 IOManager 中的相关功能
 using Main.IOManager
+using Main.EOSModule
 
 export Grid, create_grid, apply_boundary_conditions,
        init_physical_fields!, update_physical_field!,
-       read_config
+       read_config, get_refinement_level, update_refinement_level,
+       refine_grid_combined!, refine_grid_by_value!, refine_grid!
 
 ##########################################################################
 # 网格数据结构定义
@@ -43,6 +45,8 @@ export Grid, create_grid, apply_boundary_conditions,
     存储物理场数据，如密度、压力、磁场、电场等，数据类型由用户自行定义（一般为数组）。
 - config::Dict{Symbol,Any}  
     存储从外部文件读取的配置参数。
+- refinement_level::Int  
+    当前网格的细化级别，用于动态调整物理模型（如EOS）。
 """
 struct Grid
     coordinate_system::Symbol
@@ -53,8 +57,9 @@ struct Grid
     bc::Dict{Symbol, Any}
     adaptive_params::Dict{Symbol, Tuple{Float64, Float64, Float64, Float64}}
     custom_bc::Dict{Symbol, Function}
-    physical_fields::Dict{Symbol,Any}
-    config::Dict{Symbol,Any}
+    physical_fields::Dict{Symbol, Any}
+    config::Dict{Symbol, Any}
+    refinement_level::Int  # 当前网格细化级别
 end
 
 ##########################################################################
@@ -64,13 +69,14 @@ end
 function create_grid(; coordinate_system::Symbol = :cartesian,
                      limits::Dict{Symbol, Tuple{Float64, Float64}},
                      spacing::Dict{Symbol, Float64},
-                     bc::Dict{Symbol,Any} = Dict{Symbol,Any}(),
-                     adaptive_params::Dict{Symbol, Tuple{Float64, Float64, Float64, Float64}} = Dict{Symbol,Tuple{Float64,Float64,Float64,Float64}}(),
-                     stretch_funcs::Dict{Symbol, Function} = Dict{Symbol,Function}(),
-                     custom_bc::Dict{Symbol, Function} = Dict{Symbol,Function}())
+                     bc::Dict{Symbol, Any} = Dict{Symbol, Any}(),
+                     adaptive_params::Dict{Symbol, Tuple{Float64, Float64, Float64, Float64}} = Dict{Symbol, Tuple{Float64, Float64, Float64, Float64}}(),
+                     stretch_funcs::Dict{Symbol, Function} = Dict{Symbol, Function}(),
+                     custom_bc::Dict{Symbol, Function} = Dict{Symbol, Function}(),
+                     refinement_level::Int = 1)  # 允许指定初始细化级别
     coordinates = Dict{Symbol, Vector{Float64}}()
     dims = Dict{Symbol, Int}()
-    
+
     # 根据坐标系统确定维度键
     dim_keys = coordinate_system == :cartesian ? (:x, :y, :z) :
                coordinate_system == :cylindrical ? (:r, :θ, :z) :
@@ -91,84 +97,94 @@ function create_grid(; coordinate_system::Symbol = :cartesian,
     end
     
     # 初始化物理场与配置为空字典
-    physical_fields = Dict{Symbol,Any}()
-    config = Dict{Symbol,Any}()
-    
+    physical_fields = Dict{Symbol, Any}()
+    config = Dict{Symbol, Any}()
+
     return Grid(coordinate_system, limits, spacing, coordinates, dims, bc,
-                adaptive_params, custom_bc, physical_fields, config)
+                adaptive_params, custom_bc, physical_fields, config, refinement_level)
 end
 
 ##########################################################################
-# 边界条件应用函数
+# 网格细化相关函数
 ##########################################################################
 
-function apply_boundary_conditions(field::Array{Float64,1}, boundary::Symbol, grid::Grid)
-    if haskey(grid.custom_bc, boundary)
-        return grid.custom_bc[boundary](field)
-    end
-    if !haskey(grid.bc, boundary)
-        return field
-    end
-    bc_setting = grid.bc[boundary]
-    if bc_setting isa Tuple
-        bc_type, bc_value = bc_setting
-    else
-        bc_type = bc_setting
-        bc_value = nothing
-    end
+"""
+    update_refinement_level!(grid::Grid, new_level::Int)
 
-    if bc_type == :Dirichlet && bc_value !== nothing
-        field[1] = bc_value
-    elseif bc_type == :Neumann
-        field[1] = field[2]
-    elseif bc_type == :Absorbing
-        field[1] = 0.0
-    elseif bc_type == :Periodic
-        field[1] = field[end-1]
-    elseif bc_type == :Mixed && bc_value !== nothing
-        field[1] = 0.5*(field[2] + bc_value)
-    end
-    return field
+根据网格细化级别的更新，调整网格的细化级别，并通知其他模块更新相关参数（如EOS）。
+"""
+function update_refinement_level!(grid::Grid, new_level::Int)
+    grid.refinement_level = new_level
+    println("更新网格细化级别至: $new_level")
+    
+    # 根据新的细化级别，动态调整EOS等物理模型
+    adaptive_eos_coupling(grid.coordinates[:r], grid.physical_fields[:temperature], :default, grid.refinement_level)
 end
 
-##########################################################################
-# 物理场数据接口：初始化与更新
-##########################################################################
+"""
+    get_refinement_level(grid::Grid) -> Int
 
-function init_physical_fields!(grid::Grid, field_data::Dict{Symbol, T}) where T
-    for (key, value) in field_data
-        if !haskey(grid.physical_fields, key)
-            error("物理场 $key 在 grid.physical_fields 中不存在。")
+获取当前网格的细化级别。
+"""
+function get_refinement_level(grid::Grid)
+    return grid.refinement_level
+end
+
+# --------------------------
+# 网格细化函数
+# --------------------------
+
+"""
+    refine_grid_combined!(amr::AdaptiveMeshRefinement, field::Symbol, gradient_threshold::Float64, value_threshold::Float64, eos::FiniteTempEOS)
+
+结合梯度和物理场值进行网格细化，在两个标准都满足的情况下细化网格。
+"""
+function refine_grid_combined!(amr::AdaptiveMeshRefinement, field::Symbol, gradient_threshold::Float64, value_threshold::Float64, eos::FiniteTempEOS)
+    gradient = compute_gradient(amr, field)
+    field_data = amr.physical_fields[field]
+
+    for i in 1:length(gradient)
+        if gradient[i] > gradient_threshold && field_data[i] > value_threshold
+            # 对梯度和物理场值都满足条件的区域进行细化
+            amr.grid_size += 1
+            amr.current_refinement_level = min(amr.current_refinement_level + 1, amr.max_refinement_level)
+            println("在第 $(i) 位置细化网格，梯度和物理场值均满足条件")
+        elseif gradient[i] < gradient_threshold / 2 && field_data[i] < value_threshold / 2
+            # 对梯度和物理场值均较小的区域进行粗化
+            amr.grid_size = max(amr.grid_size - 1, amr.min_refinement_level)
+            amr.current_refinement_level = max(amr.current_refinement_level - 1, amr.min_refinement_level)
+            println("在第 $(i) 位置粗化网格，梯度和物理场值均较低")
         end
-        if typeof(value) != typeof(grid.physical_fields[key])
-            error("物理场 $key 的类型不匹配：预期 $(typeof(grid.physical_fields[key])), 实际 $(typeof(value))。")
+    end
+
+    # 根据当前网格细化级别调整EOS
+    adaptive_eos_coupling(amr, eos)
+end
+
+"""
+    refine_grid_by_value!(amr::AdaptiveMeshRefinement, field::Symbol, threshold::Float64, eos::FiniteTempEOS)
+
+根据物理场的值自动细化网格，依据物理量的绝对值进行细化。
+"""
+function refine_grid_by_value!(amr::AdaptiveMeshRefinement, field::Symbol, threshold::Float64, eos::FiniteTempEOS)
+    field_data = amr.physical_fields[field]
+
+    for i in 1:length(field_data)
+        if field_data[i] > threshold
+            # 对物理场值超过阈值的区域增加网格密度
+            amr.grid_size += 1
+            amr.current_refinement_level = min(amr.current_refinement_level + 1, amr.max_refinement_level)
+            println("在第 $(i) 位置细化网格，物理场值超过阈值")
+        elseif field_data[i] < threshold / 2
+            # 对物理场值较低的区域减少网格密度
+            amr.grid_size = max(amr.grid_size - 1, amr.min_refinement_level)
+            amr.current_refinement_level = max(amr.current_refinement_level - 1, amr.min_refinement_level)
+            println("在第 $(i) 位置粗化网格，物理场值低于阈值")
         end
-        grid.physical_fields[key] = value
     end
-    return grid
-end
 
-function update_physical_field!(grid::Grid, field_name::Symbol, new_data)
-    grid.physical_fields[field_name] = new_data
-    return grid
-end
-
-##########################################################################
-# 配置参数读取接口
-##########################################################################
-
-function read_config(filename::String)::Dict{Symbol,Any}
-    if endswith(lowercase(filename), ".toml")
-        config_str = read(filename, String)
-        config_dict = TOML.parse(config_str)
-    elseif endswith(lowercase(filename), ".yaml") || endswith(lowercase(filename), ".yml")
-        config_dict = YAML.load_file(filename)
-    elseif endswith(lowercase(filename), ".h5") || endswith(lowercase(filename), ".hdf5")
-        config_dict = IOManager.read_hdf5_config(filename)  # 使用 IOManager 读取 HDF5 配置
-    else
-        error("不支持的配置文件格式: $filename")
-    end
-    return IOManager.convert_keys_to_symbols(config_dict)  # 确保将字典的键转换为 Symbol
+    # 根据当前网格细化级别调整EOS
+    adaptive_eos_coupling(amr, eos)
 end
 
 end  # module GridModule
