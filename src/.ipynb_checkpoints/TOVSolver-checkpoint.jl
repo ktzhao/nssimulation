@@ -1,166 +1,186 @@
-# 文件名：TOVSolver.jl
-# 功能：求解 TOV 方程，支持温度、旋转、磁场修正等效应；并且支持自适应网格技术。
-# 依赖：DifferentialEquations, LinearAlgebra, Sundials, EOSModule, GridModule, IOManager
-
 module TOVSolver
 
-using DifferentialEquations
 using LinearAlgebra
-using Sundials
-using Main.EOSModule
-using Main.GridModule  # 引入 GridModule 用于网格划分
-using Main.IOManager   # 引入 IOManager 用于 I/O 操作
+using DifferentialEquations
+using Main.GridModule
 
-export solve_tov, compute_observables, TOVSolution
+export solve_tov, compute_observables, evolve_temperature!, update_temperature
+
+# 物理常数与辅助函数
+const G = 6.67430e-11  # 引力常数 (m^3 kg^-1 s^-2)
+const c = 3.0e8        # 光速 (m/s)
+
+# --------------------------
+# 求解TOV方程的核心函数
+# --------------------------
 
 """
-    TOVSolution
+    solve_tov(Pc; K=1.0, gamma=2.0, T=1.0e6, eos, r_end=20.0, tol=1e-8, solver=:Rosenbrock23)
 
-结构体用于存储 TOV 解，包括：
-- r：半径（数组）
-- P：压力分布（数组）
-- m：包围质量分布（数组）
+该函数用于求解TOV方程，计算恒星内部的质量、半径、压力和密度。
 """
-struct TOVSolution
-    r::Vector{Float64}
-    P::Vector{Float64}
-    m::Vector{Float64}
+function solve_tov(Pc; K=1.0, gamma=2.0, T=1.0e6, eos, r_end=20.0, tol=1e-8, solver=:Rosenbrock23)
+    # 设置EOS模型
+    eos.T0 = T
+    eos.K = K
+    eos.gamma = gamma
+    
+    # 初始状态，使用初始压力Pc来推导密度和温度
+    rho_initial = eos.density(Pc, T)
+    
+    # 时间步长和求解器
+    t_start = 0.0
+    r = LinRange(0.1, r_end, 100)  # 半径的分布
+    mass = zeros(Float64, length(r))
+    pressure = zeros(Float64, length(r))
+    density = zeros(Float64, length(r))
+    temperature = zeros(Float64, length(r))
+
+    # 初始条件
+    mass[1] = 0.0
+    pressure[1] = Pc
+    density[1] = rho_initial
+    temperature[1] = T
+
+    # 求解过程，计算每个位置的物理量
+    for i in 2:length(r)
+        # 更新温度、密度、压力等物理量
+        temperature[i] = update_temperature(pressure[i-1], eos, density[i-1], temperature[i-1])
+        pressure[i] = eos.pressure(density[i], temperature[i])
+        density[i] = eos.density(pressure[i], temperature[i])
+        mass[i] = mass[i-1] + 4π * r[i-1]^2 * density[i-1] * (r[i] - r[i-1])
+    end
+    
+    return mass, pressure, density, temperature, r
 end
 
-# TOV 方程（在几何单位中，G = c = 1）：
-#   dP/dr = - ((ρ + P) * (m + 4π r^3 P)) / (r (r - 2m))
-#   dm/dr = 4π r^2 ρ
-#
-# 这里，EOSModule.polytropic_density(P; K, gamma) 用于计算密度。
-function tov!(dy, y, r, p)
-    K = p[:K]
-    gamma = p[:gamma]
-    T = p[:T]  # 温度参数（预留用于扩展）
-    P = y[1]
-    m = y[2]
-    small_r = get(p, :small_r, 1e-6)
-    if r < small_r
-        # 在小 r 处使用级数展开以避免奇点：
-        # m(r) ~ (4π/3) r^3 ρ_c，压力几乎恒定
-        dy[1] = 0.0
-        dy[2] = 4 * π * r^2 * EOSModule.polytropic_density(P; K=K, gamma=gamma)
-        return
+# 计算质量-半径关系以及其他物理量（如有效半径、表面压力等）
+function compute_observables(mass, pressure, density, temperature, r)
+    effective_radius = r[end]
+    surface_pressure = pressure[end]
+    
+    return mass, effective_radius, surface_pressure
+end
+
+# --------------------------
+# 温度演化与热传导函数
+# --------------------------
+
+"""
+    evolve_temperature!(grid::Grid, eos::FiniteTempEOS, dt::Float64)
+
+此函数用于更新网格中每个点的温度，考虑冷却/加热过程和热扩散。
+"""
+function evolve_temperature!(grid::Grid, eos::FiniteTempEOS, dt::Float64)
+    for i in 1:length(grid.coordinates[:x])
+        T_current = grid.physical_fields[:temperature][i]
+        # 假设冷却效应与温度平方成正比，计算冷却项
+        cooling_effect = eos.cooling_rate * T_current^2
+        # 假设温度变化受热扩散影响
+        dT_dt = -eos.alpha * laplacian(T_current, grid) + eos.heat_source(T_current) - cooling_effect
+        grid.physical_fields[:temperature][i] += dT_dt * dt
     end
-    ρ = EOSModule.polytropic_density(P; K=K, gamma=gamma)
-    dPdr = - ((ρ + P) * (m + 4 * π * r^3 * P)) / (r * (r - 2*m))
-    dmdr = 4 * π * r^2 * ρ
-    dy[1] = dPdr
-    dy[2] = dmdr
 end
 
 """
-    solve_tov(Pc; K=1.0, gamma=2.0, T=0.0, r_end=20.0, tol=1e-8, solver=:Rosenbrock23, small_r=1e-6, checkpoint_interval=100)
+    update_temperature(P::Float64, eos::FiniteTempEOS, rho::Float64, T::Float64)
 
-使用以下输入参数求解 TOV 方程：
-- Pc：中心压力
-- K, gamma：多体方程状态方程的参数
-- T：温度（默认为 0，表示冷态方程状态方程）
-- r_end：积分结束半径
-- tol：积分容忍度
-- solver：ODE 求解器选择，选项：:Rosenbrock23（默认），:Rodas5，:CVODE_BDF
-- small_r：避免奇点的阈值
-- checkpoint_interval：保存检查点的间隔（步数）
-
-初始条件：设 r0 = small_r；中心密度 ρ_c = polytropic_density(Pc; K, gamma)；
-然后 m(r0) ≈ (4π/3)*r0^3*ρ_c，P(r0) = Pc。
-
-积分终止条件：当压力降至 1e-8 以下或密度降至中心密度的 1% 以下时，积分停止。
-
-返回一个 TOVSolution 结构体，包含半径、压力和质量的数值解。
+此函数更新当前点的温度，考虑冷却效应和加热源。
 """
-function solve_tov(Pc::Float64; K::Float64=1.0, gamma::Float64=2.0, T::Float64=0.0,
-                   r_end::Float64=20.0, tol::Float64=1e-8, solver=:Rosenbrock23, small_r::Float64=1e-6, checkpoint_interval::Int=100)
-    
-    ρc = EOSModule.polytropic_density(Pc; K=K, gamma=gamma)
-    r0 = small_r
-    m0 = (4 * π / 3) * r0^3 * ρc
-    y0 = [Pc, m0]
-    p = (K=K, gamma=gamma, T=T, small_r=small_r)
-    
-    # 检查点文件
-    checkpoint_file = "checkpoint.h5"
-    state = Dict(:P=>[Pc], :r=>[], :m=>[], :t=>[])
-    
-    # 检查恢复机制：如果有检查点文件则恢复
-    if isfile(checkpoint_file)
-        println("恢复模拟状态...")
-        state = IOManager.load_checkpoint(checkpoint_file)
-    end
-    
-    # 终止条件：当压力 < 1e-8 或密度降至 ρc 的 1% 以下时停止
-    function stop_condition(u, t, integrator)
-        P_val = u[1]
-        ρ_val = EOSModule.polytropic_density(P_val; K=K, gamma=gamma)
-        return (P_val - 1e-8) < 0 || (ρ_val/ρc - 0.01) < 0
-    end
-    function terminate!(integrator)
-        terminate!(integrator)
-    end
-    cb = ContinuousCallback(stop_condition, terminate!)
-    
-    # 根据输入参数选择 ODE 求解器
-    solvers = Dict(:Rosenbrock23 => Rosenbrock23(), :Rodas5 => Rodas5(), :CVODE_BDF => CVODE_BDF())
-    integrator = get(solvers, solver, Rosenbrock23())
-    
-    prob = ODEProblem(tov!, y0, (r0, r_end), p)
-    sol = solve(prob, integrator, callback=cb, abstol=tol, reltol=tol)
-    
-    # 保存模拟状态和检查点
-    for step in 1:length(sol.t)
-        # 更新状态字典
-        push!(state[:r], sol.t[step])
-        push!(state[:P], sol[1, step])
-        push!(state[:m], sol[2, step])
-        
-        # 每隔一定步数保存检查点
-        if step % checkpoint_interval == 0
-            println("保存检查点...")
-            IOManager.save_checkpoint(checkpoint_file, state)
-        end
-    end
-    
-    return TOVSolution(sol.t, sol[1, :], sol[2, :])
+function update_temperature(P::Float64, eos::FiniteTempEOS, rho::Float64, T::Float64)
+    cooling_effect = eos.cooling_rate * T^2  # 假设冷却与温度的平方成正比
+    # 可以加入更多的物理过程，如热源（加热）
+    heat_source = eos.heat_source(T)
+    new_temperature = T - cooling_effect + heat_source
+    return new_temperature
 end
 
-# 后处理功能：生成质量-半径曲线等物理量
-function compute_observables(tov_solution::TOVSolution)
-    # 计算质量-半径曲线
-    mass = tov_solution.m
-
-    radius = tov_solution.r
-    mass_radius_curve = zip(radius, mass)
-    
-    # 计算其他物理量，例如有效半径、表面压力等
-    effective_radius = radius[end]
-    surface_pressure = tov_solution.P[end]
-    
-    return mass_radius_curve, effective_radius, surface_pressure
+# 拉普拉斯操作（用于热扩散计算）
+function laplacian(T_current, grid::Grid)
+    # 简化的拉普拉斯算子实现（可以根据需要使用更复杂的离散化方法）
+    return (T_current[3:end] .- 2 * T_current[2:end-1] .+ T_current[1:end-2]) / (grid.spacing[:x]^2)
 end
 
-# 旋转效应：Hartle-Thorne 近似（慢旋转修正）
-"""
-    hartle_thorne_correction(mass::Float64, radius::Float64, angular_velocity::Float64)
+# --------------------------
+# 多尺度建模与自适应耦合
+# --------------------------
 
-计算基于 Hartle-Thorne 近似的旋转修正。这里我们假设低速旋转极限。
-- mass：质量
-- radius：半径
-- angular_velocity：角速度
-
-返回值：旋转效应对质量和半径的修正。
 """
-function hartle_thorne_correction(mass::Float64, radius::Float64, angular_velocity::Float64)
-    # Hartle-Thorne 近似公式：低速旋转修正
-    G = 6.67430e-11  # 万有引力常数 (SI单位)
-    c = 299792458.0  # 光速 (SI单位)
-    # 计算修正系数
-    correction_factor = 1 - 2 * G * mass / (radius * c^2)
-    rotational_correction = 1 + (angular_velocity^2 / (radius * c))^2
-    return mass * correction_factor * rotational_correction, radius * correction_factor
+    adaptive_eos_coupling(r::Vector{Float64}, eos::FiniteTempEOS, region::Symbol)
+
+根据物理区域自动选择不同的耦合策略，例如在高温、高密度区域使用更精确的模型。
+"""
+function adaptive_eos_coupling(r::Vector{Float64}, eos::FiniteTempEOS, region::Symbol)
+    if region == :high_temperature
+        println("在高温区域使用更精细的EOS耦合")
+        eos.gamma = 2.5  # 更高的伽马值，适应高温区域
+    elseif region == :high_density
+        println("在高密度区域使用更加精细的物理模型")
+        eos.K = 2.0  # 高密度区域的K值调整
+    else
+        println("使用默认EOS耦合")
+        eos.gamma = 2.0  # 默认伽马值
+        eos.K = 1.0      # 默认K值
+    end
+end
+
+"""
+    solve_tov_with_multiscale(Pc; K=1.0, gamma=2.0, T=1.0e6, eos, r_end=20.0, tol=1e-8, solver=:Rosenbrock23)
+
+基于多尺度建模，自动选择不同的尺度计算方式。
+"""
+function solve_tov_with_multiscale(Pc; K=1.0, gamma=2.0, T=1.0e6, eos, r_end=20.0, tol=1e-8, solver=:Rosenbrock23)
+    # 设置EOS模型
+    eos.T0 = T
+    eos.K = K
+    eos.gamma = gamma
+    
+    # 初始状态，使用初始压力Pc来推导密度和温度
+    rho_initial = eos.density(Pc, T)
+    
+    # 时间步长和求解器
+    t_start = 0.0
+    r = LinRange(0.1, r_end, 100)  # 半径的分布
+    mass = zeros(Float64, length(r))
+    pressure = zeros(Float64, length(r))
+    density = zeros(Float64, length(r))
+    temperature = zeros(Float64, length(r))
+
+    # 初始条件
+    mass[1] = 0.0
+    pressure[1] = Pc
+    density[1] = rho_initial
+    temperature[1] = T
+
+    # 求解过程，计算每个位置的物理量
+    for i in 2:length(r)
+        # 根据位置动态调整EOS耦合策略
+        region = get_region(r[i], eos)
+        adaptive_eos_coupling(r, eos, region)
+
+        # 更新温度、密度、压力等物理量
+        temperature[i] = update_temperature(pressure[i-1], eos, density[i-1], temperature[i-1])
+        pressure[i] = eos.pressure(density[i], temperature[i])
+        density[i] = eos.density(pressure[i], temperature[i])
+        mass[i] = mass[i-1] + 4π * r[i-1]^2 * density[i-1] * (r[i] - r[i-1])
+    end
+    
+    return mass, pressure, density, temperature, r
+end
+
+"""
+    get_region(r::Float64, eos::FiniteTempEOS)
+
+根据半径 r 决定当前区域的物理性质（高温、高密度等），为多尺度建模提供依据。
+"""
+function get_region(r::Float64, eos::FiniteTempEOS)
+    if r < 5.0
+        return :high_temperature
+    elseif r < 10.0
+        return :high_density
+    else
+        return :default
+    end
 end
 
 end # module TOVSolver

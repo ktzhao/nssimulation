@@ -1,92 +1,150 @@
-# 文件名：AMRModule.jl
-# 功能：实现自适应网格（AMR）算法，根据物理量（如密度、磁场梯度）自适应地细化或粗化网格，并与求解器接口对接，处理非均匀网格。
-# 依赖：LinearAlgebra, DifferentialEquations
-
 module AMRModule
 
 using LinearAlgebra
-using DifferentialEquations
+using CUDA
 
-export AMRGrid, refine_grid, coarsen_grid, adapt_grid, amr_solver
+export AdaptiveMeshRefinement, refine_grid, compute_gradient, adaptive_timestep
+
+# --------------------------
+# 自适应网格细化 (AMR)
+# --------------------------
 
 """
-    AMRGrid
+    AdaptiveMeshRefinement
 
-结构体用于表示自适应网格，包括：
-- r：网格坐标（径向坐标）
-- dx：网格分辨率
-- refinement_factor：细化因子
-- coarsening_threshold：粗化阈值
-- grid_data：网格上的数据，通常是物理量（如密度、磁场等）
+自适应网格细化类，根据物理量的梯度自动调整网格分辨率。
 """
-struct AMRGrid
-    r::Vector{Float64}               # 网格坐标
-    dx::Vector{Float64}              # 网格间距（分辨率）
-    refinement_factor::Float64       # 细化因子
-    coarsening_threshold::Float64    # 粗化阈值
-    grid_data::Vector{Vector{Float64}}  # 网格数据（如密度、磁场等）
+mutable struct AdaptiveMeshRefinement
+    grid_size::Int
+    max_refinement_level::Int
+    min_refinement_level::Int
+    refinement_threshold::Float64
+    spacing::Float64
+    coordinates::Dict{Symbol, Array{Float64, 1}}   # 用于存储不同维度的网格坐标
+    physical_fields::Dict{Symbol, Array{Float64, 1}} # 存储物理场，如密度、温度、压力等
 end
 
-# 基于物理量（如密度或磁场梯度）自适应细化网格
-# 输入：物理量梯度数据，网格
-# 输出：细化后的网格
-function refine_grid(grid::AMRGrid, physical_gradient::Vector{Float64})
-    # 计算物理量的梯度并判断是否需要细化网格
-    for i in 1:length(physical_gradient)
-        if physical_gradient[i] > grid.coarsening_threshold
-            # 根据梯度大于阈值的区域细化网格
-            grid.r = append!(grid.r, grid.r[i] + grid.refinement_factor * (grid.r[i+1] - grid.r[i]))
-            grid.dx = append!(grid.dx, grid.dx[i] / grid.refinement_factor)  # 增加分辨率
+# --------------------------
+# 网格细化函数
+# --------------------------
+
+"""
+    refine_grid!(amr::AdaptiveMeshRefinement, field::Symbol)
+
+根据物理场的梯度自动细化网格。在区域梯度变化剧烈的地方使用更精细的网格。
+"""
+function refine_grid!(amr::AdaptiveMeshRefinement, field::Symbol)
+    # 计算物理场的梯度
+    gradient = compute_gradient(amr, field)
+
+    # 根据梯度细化网格
+    for i in 1:length(gradient)
+        if gradient[i] > amr.refinement_threshold
+            # 对需要细化的区域增加网格密度
+            amr.grid_size += 1
+            println("在第 $(i) 位置细化网格")
+        elseif gradient[i] < amr.refinement_threshold / 2
+            # 对变化较小的区域减少网格密度
+            amr.grid_size = max(amr.grid_size - 1, amr.min_refinement_level)
+            println("在第 $(i) 位置粗化网格")
         end
     end
-    return grid
 end
 
-# 基于物理量梯度自适应粗化网格
-# 输入：物理量梯度数据，网格
-# 输出：粗化后的网格
-function coarsen_grid(grid::AMRGrid, physical_gradient::Vector{Float64})
-    # 计算物理量的梯度并判断是否需要粗化网格
-    for i in 1:length(physical_gradient)
-        if physical_gradient[i] < grid.coarsening_threshold
-            # 根据梯度小于阈值的区域粗化网格
-            grid.r = deleteat!(grid.r, i)
-            grid.dx = deleteat!(grid.dx, i)  # 减少分辨率
+# --------------------------
+# 计算梯度
+# --------------------------
+
+"""
+    compute_gradient(amr::AdaptiveMeshRefinement, field::Symbol)
+
+计算物理场（如温度、密度、压力等）的梯度，帮助判断在哪些区域需要进行网格细化。
+"""
+function compute_gradient(amr::AdaptiveMeshRefinement, field::Symbol)
+    field_data = amr.physical_fields[field]
+    gradient = zeros(Float64, length(field_data))
+
+    # 简化的梯度计算方法（可以使用更复杂的离散化方法）
+    for i in 2:length(field_data)-1
+        gradient[i] = (field_data[i+1] - field_data[i-1]) / (amr.spacing)
+    end
+
+    return gradient
+end
+
+# --------------------------
+# 自适应时间步长选择
+# --------------------------
+
+"""
+    adaptive_timestep!(amr::AdaptiveMeshRefinement, dt::Float64)
+
+根据物理场的梯度和网格大小自动调整时间步长。
+"""
+function adaptive_timestep!(amr::AdaptiveMeshRefinement, dt::Float64)
+    # 计算物理场的梯度
+    gradient = compute_gradient(amr, :temperature)
+
+    # 自动调整时间步长（例如在高梯度区域使用更小的时间步长）
+    max_gradient = maximum(abs.(gradient))
+    dt_adjustment_factor = 1.0 / (1.0 + max_gradient)  # 较大梯度区域，时间步长较小
+    new_dt = dt * dt_adjustment_factor
+
+    return new_dt
+end
+
+# --------------------------
+# GPU加速相关功能
+# --------------------------
+
+"""
+    refine_grid_gpu!(amr::AdaptiveMeshRefinement, field::Symbol)
+
+GPU加速版本的网格细化函数，利用CUDA加速梯度计算和网格细化过程。
+"""
+function refine_grid_gpu!(amr::AdaptiveMeshRefinement, field::Symbol)
+    # 计算物理场的梯度
+    gradient = compute_gradient_gpu(amr, field)
+
+    # 根据梯度细化网格
+    for i in 1:length(gradient)
+        if gradient[i] > amr.refinement_threshold
+            # 对需要细化的区域增加网格密度
+            amr.grid_size += 1
+            println("在第 $(i) 位置细化网格 (GPU加速)")
+        elseif gradient[i] < amr.refinement_threshold / 2
+            # 对变化较小的区域减少网格密度
+            amr.grid_size = max(amr.grid_size - 1, amr.min_refinement_level)
+            println("在第 $(i) 位置粗化网格 (GPU加速)")
         end
     end
-    return grid
 end
 
-# 适应性网格调整，结合细化与粗化
-# 输入：当前网格和物理量梯度，输出自适应调整后的网格
-function adapt_grid(grid::AMRGrid, physical_gradient::Vector{Float64})
-    # 细化网格
-    grid = refine_grid(grid, physical_gradient)
-    # 粗化网格
-    grid = coarsen_grid(grid, physical_gradient)
-    return grid
+"""
+    compute_gradient_gpu(amr::AdaptiveMeshRefinement, field::Symbol)
+
+GPU加速版本的梯度计算函数
+"""
+function compute_gradient_gpu(amr::AdaptiveMeshRefinement, field::Symbol)
+    field_data = amr.physical_fields[field]
+    gradient = CUDA.fill(0.0, length(field_data))
+
+    # GPU加速的梯度计算
+    @cuda threads=256 compute_gradient_kernel(field_data, gradient, amr.spacing)
+
+    return Array(gradient)
 end
 
-# 适应性网格求解器接口：根据网格分辨率更新物理量
-function amr_solver(grid::AMRGrid, physical_data::Vector{Float64}, dt::Float64)
-    # 更新物理量的过程，这里假设更新物理量是通过简单的时间演化
-    # 实际上可能涉及到对网格数据的数值积分、差分等操作
-    for i in 1:length(physical_data)
-        physical_data[i] += dt * physical_data[i]  # 简单的时间推进
+"""
+    compute_gradient_kernel
+
+CUDA内核函数：计算物理场的梯度
+"""
+function compute_gradient_kernel(field_data, gradient, spacing)
+    i = threadIdx().x + (blockIdx().x - 1) * blockDim().x
+    if i > 1 && i < length(field_data)-1
+        gradient[i] = (field_data[i+1] - field_data[i-1]) / spacing
     end
-    
-    # 在网格上更新物理量（例如密度、磁场等）
-    grid.grid_data = [physical_data]  # 将更新的物理量存储到网格数据中
-    return grid
 end
 
-# 生成初始网格：根据给定的物理量、网格大小、分辨率等初始化网格
-function create_initial_grid(r_min::Float64, r_max::Float64, num_points::Int64, refinement_factor::Float64, coarsening_threshold::Float64)
-    r = LinRange(r_min, r_max, num_points)
-    dx = diff(r)
-    grid_data = [zeros(Float64, num_points)]
-    grid = AMRGrid(r, dx, refinement_factor, coarsening_threshold, grid_data)
-    return grid
-end
-
-end  # module AMRModule
+end # module AMRModule

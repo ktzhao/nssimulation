@@ -6,7 +6,7 @@ using TOML
 using YAML
 
 # 引入 IOManager 中的相关功能
-import IOManager
+using Main.IOManager
 
 export Grid, create_grid, apply_boundary_conditions,
        init_physical_fields!, update_physical_field!,

@@ -3,8 +3,8 @@ module IOManager
 using HDF5
 using Distributed
 using LinearAlgebra
-using FileLock
-using SharedVector
+#using FileLock
+#using SharedVector
 using Random
 
 # 文件锁定机制，用于并行环境下避免多进程写入冲突

@@ -1,73 +1,122 @@
 # main.jl
 #
-# 这个主程序调用 EOSModule 和 TOVSolver 模块进行 TOV 星模型的求解。
-# 采用多项式状态方程（也可以根据需求修改为其他 EOS）作为 EOS，
-# 使用 DifferentialEquations.jl 求解 TOV 方程，
-# 最后输出半径、压力和质量分布，并绘制压力分布图。
-#
-# 使用前请确保安装以下包：
-#   - DifferentialEquations.jl
-#   - Plots.jl
-#
-# 运行命令（在终端中）：
-#   julia --project main.jl
+# 这是一个TOV模拟程序，结合了网格生成、TOV求解、并行计算和自适应网格（AMR）技术。
+# 此程序假定已加载所有依赖模块（如 TOVSolver.jl, GridModule.jl, DomainDecomposition.jl, AMRModule.jl, Communication.jl, AdvancedParallel.jl）
 
-using DifferentialEquations
-using Plots
-
-# 加载 EOS 模块和 TOV 求解模块
-
-include("GridModule.jl")
+include("IOManager.jl")
 include("EOSModule.jl")
+include("GridModule.jl")
 include("TOVSolver.jl")
+include("Communication.jl")
+include("DomainDecomposition.jl")
+include("AMRModule.jl")
+include("AdvancedParallel.jl")
 
-using .GridModule
 using .EOSModule
+using .IOManager
+using .GridModule
 using .TOVSolver
-# 设置 TOV 模型参数
-Pc = 1e-3          # 中心压力（可根据物理意义调整单位和数值）
-K = 1.0            # 多项式 EOS 常数
-gamma = 2.0        # 多项式指数
-T = 0.0            # 温度（0 表示不考虑温度效应）
-B = 0.0            # 磁场强度（0 表示不考虑磁场效应）
-omega = 0.0        # 旋转角速度（0 表示不考虑旋转效应）
-r_end = 10.0       # 积分终止半径
-tol = 1e-8         # 积分容差
-small_r = 1e-6     # 避免奇点的最小半径
 
-println("开始求解 TOV 方程……")
-solution = solve_tov(Pc; K=K, gamma=gamma, T=T, B=B, omega=omega, r_end=r_end, tol=tol, small_r=small_r)
+using .DomainDecomposition
+using .AMRModule
+using .Communication
+using .AdvancedParallel
+using LinearAlgebra
+using Distributed
 
-# 输出求解结果
-println("\nTOV 模型求解结果：")
-println("半径 (r) 数组：")
-# println(solution.r)  # 可取消注释查看完整半径数组
-println("压力 (P) 数组：")
-# println(solution.P)  # 可取消注释查看完整压力数组
-println("质量 (m) 数组：")
-# println(solution.m)  # 可取消注释查看完整质量数组
-println("最终星体半径： $(maximum(solution.r))")
-println("最终星体质量： $(maximum(solution.m))")
+# 全局网格设置
+function create_global_grid()
+    # 设置全局网格的空间范围和分辨率
+    r_min = 1.0
+    r_max = 20.0
+    num_points = 100
+    grid_spacing = (r_max - r_min) / (num_points - 1)
+    
+    # 初始化网格
+    r = LinRange(r_min, r_max, num_points)
+    dx = repeat([grid_spacing], num_points)
+    
+    # 创建全局网格对象
+    global_grid = GridModule.create_grid(coordinate_system = :cartesian, 
+                                          limits = Dict(:x => (r_min, r_max)),
+                                          spacing = Dict(:x => grid_spacing), 
+                                          bc = Dict(:x => :Dirichlet))
+    return global_grid
+end
 
-# 计算并输出观测量
-observables = compute_observables(solution, K, gamma; T=T)
-println("\n星体的观测量：")
-println("星体半径 (R)： $(observables[:R])")
-println("星体质量 (M)： $(observables[:M])")
-println("星体惯性矩 (I)： $(observables[:I])")
-println("紧凑度 (Compactness)： $(observables[:compactness])")
-println("引力红移 (Redshift)： $(observables[:redshift])")
-println("惯性比 (Inertia Ratio)： $(observables[:inertia_ratio])")
+# TOV模拟设置
+function run_tov_simulation(global_grid, Pc, T)
+    # 创建TOVSolver并求解TOV方程
+    eos = EOSModule.finite_temp_eos(1.0, 2.0, 0.0, 0.1)  # 选择适当的EOS模型
+    tov_solution = TOVSolver.solve_tov(Pc; K=1.0, gamma=2.0, T=T, eos=eos, r_end=20.0, tol=1e-8, solver=:Rosenbrock23)
+    
+    # 输出结果，例如质量-半径曲线
+    mass_radius_curve, effective_radius, surface_pressure = TOVSolver.compute_observables(tov_solution)
+    println("Effective Radius: ", effective_radius)
+    println("Surface Pressure: ", surface_pressure)
+    
+    # 返回TOV解的结果
+    return tov_solution
+end
 
-# 绘制压力分布图
-plot(solution.r, solution.P,
-     xlabel="Radius", ylabel="Pressure",
-     title="TOV Pressure Profile", lw=2)
-savefig("tov_pressure_profile.png")
-println("压力分布图已保存为 tov_pressure_profile.png")
+# 网格分解与负载均衡
+function decompose_grid(global_grid)
+    # 使用3D域分解
+    overlap = (1, 1, 1)
+    proc_dims = (2, 2, 2)  # 假设2x2x2的进程网格布局
+    
+    # 进行网格分解
+    domains = DomainDecomposition.decompose_grid_3d(global_grid; overlap=overlap, proc_dims=proc_dims)
+    
+    # 返回分解后的子域
+    return domains
+end
 
-# 可选：如果需要计算旋转效应的修正，可以如下调用：
-rotation_corrections = compute_rotation_corrections(solution, omega)
-println("\n旋转效应修正：")
-println("质量修正 (ΔM)： $(rotation_corrections[:delta_mass])")
-println("半径修正 (ΔR)： $(rotation_corrections[:delta_radius])")
+# AMR自适应网格处理
+function adapt_grid(global_grid, tov_solution)
+    # 基于TOV解进行网格细化
+    physical_gradient = abs.(diff(tov_solution.P))
+    amr_grid = AMRModule.create_initial_grid(1.0, 20.0, 100, 1.5, 0.1)
+    
+    # 调整网格
+    amr_grid = AMRModule.adapt_grid(amr_grid, physical_gradient)
+    
+    return amr_grid
+end
+
+# 主函数，组合所有模块
+
+    # 初始化全局网格
+global_grid = create_global_grid()
+    
+    # 设置初始中心压力和温度
+Pc = 1.0e15  # 初始中心压力，单位可以根据实际需要进行设置
+T = 1.0e6    # 初始温度，根据需要调整
+    
+    # 求解TOV方程
+tov_solution = run_tov_simulation(global_grid, Pc, T)
+    
+    # 进行网格分解
+domains = decompose_grid(global_grid)
+    
+    # 使用自适应网格
+amr_grid = adapt_grid(global_grid, tov_solution)
+    
+    # 进行并行计算，假设已经启用了Distributed模块
+@everywhere begin
+     # 在每个子域上执行并行计算，调用相应的求解器
+    println("Running parallel computation on process ", myid())
+end
+    
+    # 处理并行计算的结果
+comm_performance = Communication.comm_performance_report()
+println("Communication performance: ", comm_performance)
+end
+
+# 初始化并行环境（如果需要）
+#if !isdistributed()
+    #addprocs(4)  # 假设我们启动4个进程进行计算
+#end
+
+# 执行主模拟
+#main()

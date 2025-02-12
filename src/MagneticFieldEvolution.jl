@@ -1,73 +1,107 @@
-# 文件名：MagneticFieldModule.jl
-# 功能：定义纯偶极磁场模型，计算磁流函数 Ψ(r,θ)，从磁流函数计算磁场分量（B_r, B_θ）及其模值；
-#       引入多极修正（如二阶勒让德多项式修正），模拟磁场演化过程，支持一维、二维和三维磁扩散模型。
-# 依赖：LinearAlgebra, SpecialFunctions
-
 module MagneticFieldModule
 
 using LinearAlgebra
 using SpecialFunctions
 
 # 计算纯偶极磁场的磁流函数 Ψ(r, θ)
-# 输入：r - 径向坐标，θ - 极角坐标
-# 输出：磁流函数 Ψ(r, θ)
+"""
+    magnetic_potential(r, θ)
+
+计算在给定位置 (r, θ) 处的磁流函数 Ψ(r, θ)，
+对于偶极磁场，磁流函数是与半径 r 和极角 θ 的函数。
+"""
 function magnetic_potential(r, θ)
     return r^2 * sin(θ)
 end
 
-# 从磁流函数 Ψ(r, θ) 计算磁场分量 B_r 和 B_θ
-# 输入：r - 径向坐标，θ - 极角坐标
-# 输出：磁场分量 B_r 和 B_θ
-function magnetic_field_components(r, θ)
-    Ψ = magnetic_potential(r, θ)
-    B_r = -diff(Ψ, r)
-    B_θ = diff(Ψ, θ) / r
-    return B_r, B_θ
+# 自适应磁场耦合（增加修正项）
+"""
+    adaptive_magnetic_field_coupling(r::Vector{Float64}, θ::Vector{Float64}, region::Symbol)
+
+根据不同区域（如高磁场区域）动态调整磁场耦合强度或修正项。
+"""
+function adaptive_magnetic_field_coupling(r::Vector{Float64}, θ::Vector{Float64}, region::Symbol)
+    if region == :high_magnetic_field
+        println("在高磁场区域使用更强的磁场耦合")
+        # 这里可以加入更复杂的磁场耦合修正
+        return magnetic_potential(r, θ) * 2  # 增加耦合修正
+    else
+        println("使用默认磁场耦合")
+        return magnetic_potential(r, θ)  # 默认磁场耦合
+    end
 end
 
-# 计算磁场的模值 B
-# 输入：r - 径向坐标，θ - 极角坐标
-# 输出：磁场的模值 B
-function magnetic_field_magnitude(r, θ)
-    B_r, B_θ = magnetic_field_components(r, θ)
-    return sqrt(B_r^2 + B_θ^2)
+# -----------------------
+# 计算磁场修正的梯度
+# -----------------------
+
+"""
+    compute_magnetic_field_gradient(r::Vector{Float64}, θ::Vector{Float64}, region::Symbol)
+
+计算磁场在不同区域的梯度，返回梯度值，帮助自适应网格进行磁场修正。
+"""
+function compute_magnetic_field_gradient(r::Vector{Float64}, θ::Vector{Float64}, region::Symbol)
+    # 假设磁场梯度仅依赖于半径 r 和极角 θ
+    grad_r = gradient(r)
+    grad_θ = gradient(θ)
+    
+    # 对于高磁场区域，可以增强磁场梯度
+    if region == :high_magnetic_field
+        grad_r *= 1.5
+        grad_θ *= 1.5
+    end
+    
+    return grad_r, grad_θ
 end
 
-# 引入多极修正（如二阶勒让德多项式修正）以模拟更复杂的磁场
-# 输入：r - 径向坐标，θ - 极角坐标，l - 多极阶数
-# 输出：修正后的磁流函数 Ψ(r, θ)
-function multipole_correction(r, θ, l)
-    P_l = legendre(l, cos(θ))
-    return r^2 * P_l
+# -------------------------
+# 磁场与流体耦合
+# -------------------------
+
+"""
+    couple_magnetic_field_and_fluid(r::Vector{Float64}, θ::Vector{Float64}, fluid_density::Vector{Float64}, region::Symbol)
+
+结合流体密度与磁场，进行磁场与流体耦合计算，考虑自适应磁场修正。
+"""
+function couple_magnetic_field_and_fluid(r::Vector{Float64}, θ::Vector{Float64}, fluid_density::Vector{Float64}, region::Symbol)
+    magnetic_field = adaptive_magnetic_field_coupling(r, θ, region)
+    
+    # 这里可以加入流体力学模型与磁场耦合的计算
+    coupled_field = magnetic_field .* fluid_density  # 假设磁场与流体的耦合是简单的乘积关系
+    return coupled_field
 end
 
-# 从修正后的磁流函数 Ψ(r, θ) 计算磁场分量 B_r 和 B_θ
-# 输入：r - 径向坐标，θ - 极角坐标，l - 多极阶数
-# 输出：修正后的磁场分量 B_r 和 B_θ
-function multipole_magnetic_field_components(r, θ, l)
-    Ψ = multipole_correction(r, θ, l)
-    B_r = -diff(Ψ, r)
-    B_θ = diff(Ψ, θ) / r
-    return B_r, B_θ
+# -----------------------
+# 磁场修正应用到网格
+# -----------------------
+
+"""
+    apply_magnetic_field_correction!(grid::Grid, r::Vector{Float64}, θ::Vector{Float64}, region::Symbol)
+
+应用磁场修正到网格数据，依据当前物理区域动态调整磁场强度。
+"""
+function apply_magnetic_field_correction!(grid::Grid, r::Vector{Float64}, θ::Vector{Float64}, region::Symbol)
+    # 获取当前区域的磁场修正
+    magnetic_field = adaptive_magnetic_field_coupling(r, θ, region)
+    
+    # 将修正后的磁场数据更新到网格中
+    for i in 1:length(r)
+        grid.physical_fields[:magnetic_field][i] *= magnetic_field[i]
+    end
 end
 
-# 计算修正后的磁场的模值 B
-# 输入：r - 径向坐标，θ - 极角坐标，l - 多极阶数
-# 输出：修正后的磁场的模值 B
-function multipole_magnetic_field_magnitude(r, θ, l)
-    B_r, B_θ = multipole_magnetic_field_components(r, θ, l)
-    return sqrt(B_r^2 + B_θ^2)
+# -----------------------
+# 辅助函数：计算一阶导数（梯度）
+# -----------------------
+
+"""
+    gradient(x::Vector{Float64})
+
+计算一维数组的梯度（数值微分），返回梯度值。
+"""
+function gradient(x::Vector{Float64})
+    dx = diff(x)
+    return [0.0; (dx[1:end-1] + dx[2:end]) / 2.0; 0.0]  # 简单的中心差分
 end
 
-# 模拟磁场演化过程（适用于 1D、2D、3D 磁扩散模型）
-# 输入：r - 径向坐标，θ - 极角坐标，l - 多极阶数，时间步长 dt，扩散系数 D
-# 输出：演化后的磁场分量 B_r 和 B_θ
-function magnetic_field_evolution(r, θ, l, dt, D)
-    B_r, B_θ = multipole_magnetic_field_components(r, θ, l)
-    # 计算磁场的时间导数（简化模型）
-    dB_r = -D * diff(B_r, r) * dt
-    dB_θ = -D * diff(B_θ, θ) * dt
-    return B_r + dB_r, B_θ + dB_θ
-end
-
-end # module MagneticFieldModule
+end  # module MagneticFieldModule
