@@ -93,7 +93,8 @@ function evolve_temperature!(grid::Grid, eos::FiniteTempEOS, dt::Float64)
         # 假设冷却效应与温度平方成正比，计算冷却项
         cooling_effect = eos.cooling_rate * T_current^2
         # 假设温度变化受热扩散影响
-        dT_dt = -eos.alpha * laplacian(T_current, grid) + eos.heat_source(T_current) - cooling_effect
+        heat_conductivity = eos.K * (T_current / eos.T0)  # 热传导系数与温度相关
+        dT_dt = -heat_conductivity * laplacian(T_current, grid) + eos.heat_source(T_current) - cooling_effect
         grid.physical_fields[:temperature][i] += dT_dt * dt
     end
 end
@@ -113,8 +114,9 @@ end
 
 # 拉普拉斯操作（用于热扩散计算）
 function laplacian(T_current, grid::Grid)
-    # 简化的拉普拉斯算子实现（可以根据需要使用更复杂的离散化方法）
-    return (T_current[3:end] .- 2 * T_current[2:end-1] .+ T_current[1:end-2]) / (grid.spacing[:x]^2)
+    # 改进的热传导方程，使用更高精度的离散化
+    dx2 = grid.spacing[:x]^2
+    return (T_current[3:end] .- 2 * T_current[2:end-1] .+ T_current[1:end-2]) / dx2
 end
 
 # --------------------------

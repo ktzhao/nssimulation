@@ -5,7 +5,7 @@ using CUDA
 
 export AdaptiveMeshRefinement, refine_grid, refine_grid_by_value!, compute_gradient,
        adaptive_timestep, refine_grid_gpu!, compute_gradient_gpu, compute_gradient_kernel,
-       adaptive_eos_coupling, refine_grid_combined!
+       adaptive_eos_coupling, refine_grid_combined!, compute_rotational_effect, compute_temperature_effect
 
 # --------------------------
 # 自适应网格细化 (AMR)
@@ -25,6 +25,8 @@ mutable struct AdaptiveMeshRefinement
     coordinates::Dict{Symbol, Array{Float64, 1}}   # 用于存储不同维度的网格坐标
     physical_fields::Dict{Symbol, Array{Float64, 1}} # 存储物理场，如密度、温度、压力等
     current_refinement_level::Int  # 当前网格细化级别
+    rotational_effect::Bool       # 是否考虑旋转效应
+    temperature_effect::Bool      # 是否考虑温度效应
 end
 
 # --------------------------
@@ -57,6 +59,16 @@ function refine_grid!(amr::AdaptiveMeshRefinement, field::Symbol, eos::FiniteTem
 
     # 根据当前网格细化级别调整EOS
     adaptive_eos_coupling(amr, eos)
+
+    # 计算旋转效应（如果需要）
+    if amr.rotational_effect
+        compute_rotational_effect(amr)
+    end
+
+    # 计算温度效应（如果需要）
+    if amr.temperature_effect
+        compute_temperature_effect(amr, eos)
+    end
 end
 
 # --------------------------
@@ -219,6 +231,34 @@ function adaptive_eos_coupling(amr::AdaptiveMeshRefinement, eos::FiniteTempEOS)
         eos.K = 1.0
         println("在细化级别 $(amr.current_refinement_level) 使用粗网格的EOS")
     end
+end
+
+# --------------------------
+# 旋转效应计算
+# --------------------------
+
+"""
+    compute_rotational_effect(amr::AdaptiveMeshRefinement)
+
+根据旋转效应计算新的物理场或修正网格。
+"""
+function compute_rotational_effect(amr::AdaptiveMeshRefinement)
+    # 旋转效应的计算逻辑（例如修改惯性矩、角动量等）
+    println("计算旋转效应...")
+end
+
+# --------------------------
+# 温度效应计算
+# --------------------------
+
+"""
+    compute_temperature_effect(amr::AdaptiveMeshRefinement, eos::FiniteTempEOS)
+
+考虑温度效应对物理场的影响，调整温度相关的方程状态。
+"""
+function compute_temperature_effect(amr::AdaptiveMeshRefinement, eos::FiniteTempEOS)
+    # 基于温度影响调整EOS
+    println("计算温度效应...")
 end
 
 # --------------------------

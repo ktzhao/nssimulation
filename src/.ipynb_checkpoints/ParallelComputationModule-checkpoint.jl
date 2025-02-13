@@ -5,6 +5,8 @@ using LinearAlgebra
 using SharedVector
 using Threads
 using CUDA
+using Base.Threads: Atomic, atomic_add!
+using Random
 
 # ------------------------------
 # GPU 加速部分
@@ -21,34 +23,43 @@ function gpu_accelerated_update(grid::AMRGrid)
     d_grid_data = CUDA.fill(0.0f32, length(grid.r))  # 创建 GPU 数组
     CUDA.copyto!(d_grid_data, grid.grid_data)        # 将数据从 CPU 转移到 GPU
     
-    # 热传导计算（作为示例）
-    d_grid_data .= d_grid_data .+ 0.1f32  # 这只是一个示意，实际应使用更复杂的计算
+    # 热传导计算（示例）
+    temperature_gradient = compute_temperature_gradient(grid)
+    d_grid_data .= d_grid_data .+ temperature_gradient * 0.1f32
 
-    # 磁场耦合或流体力学计算（根据具体问题进行扩展）
-    # 例如：d_grid_data = d_grid_data * magnetic_field_coupling_factor
+    # 磁场耦合计算
+    magnetic_field = compute_magnetic_field(grid)
+    d_grid_data .= d_grid_data .+ magnetic_field * 0.05f32
 
     # 将计算结果从 GPU 拷贝回 CPU
     CUDA.copyto!(grid.grid_data, d_grid_data)  
 end
 
 """
-    gpu_convolution_operation(grid::AMRGrid)
+    compute_temperature_gradient(grid::AMRGrid)
 
-此函数演示了在GPU上执行卷积操作。卷积常用于图像处理、热传导、流体力学模拟等领域。
+计算网格上的温度梯度，作为热传导的基础。
 """
-function gpu_convolution_operation(grid::AMRGrid)
-    kernel = CUDA.fill(1.0f32, 3, 3)  # 示例卷积核
-    d_kernel = CUDA.fill(0.0f32, 3, 3) 
-    CUDA.copyto!(d_kernel, kernel)     # 将卷积核数据传输到 GPU
-    
-    # 假设我们要对网格数据进行卷积
-    d_grid_data = CUDA.fill(0.0f32, length(grid.r))  # 创建 GPU 数组
-    CUDA.copyto!(d_grid_data, grid.grid_data)        # 将数据从 CPU 转移到 GPU
+function compute_temperature_gradient(grid::AMRGrid)
+    temp_grad = zeros(Float32, length(grid.r))
+    for i in 2:length(grid.r)-1
+        temp_grad[i] = (grid.grid_data[i+1] - grid.grid_data[i-1]) / 2.0f32
+    end
+    return temp_grad
+end
 
-    # 执行卷积（示例：逐元素与卷积核相乘）
-    d_grid_data .= d_grid_data .+ 0.1f32  # 这只是一个示意，实际应使用卷积操作
+"""
+    compute_magnetic_field(grid::AMRGrid)
 
-    CUDA.copyto!(grid.grid_data, d_grid_data)  # 将结果返回给 CPU
+根据网格数据计算磁场，这里假设磁场与温度和密度有关。
+"""
+function compute_magnetic_field(grid::AMRGrid)
+    magnetic_field = zeros(Float32, length(grid.r))
+    for i in 1:length(grid.r)
+        # 假设磁场与温度的关系
+        magnetic_field[i] = grid.grid_data[i] * 0.05f32  # 示例计算
+    end
+    return magnetic_field
 end
 
 # ------------------------------
@@ -88,9 +99,18 @@ function parallel_update_domain(grid::AMRGrid, num_workers::Int)
     addprocs(num_workers)  # 添加工作进程
     @everywhere begin
         function update_worker(worker_id::Int, grid::AMRGrid)
-            # 每个worker负责更新分配到的网格区域
-            println("Worker ", worker_id, " is processing grid data.")
-            gpu_accelerated_update(grid)  # 使用GPU加速
+            # 计算每个子任务的负载
+            load = compute_task_load(grid)
+            println("Worker ", worker_id, " is processing grid data with load ", load)
+            
+            # 动态负载均衡：根据负载信息调整工作分配
+            if load > threshold
+                # 假设阈值是根据计算需求设定的
+                println("Worker ", worker_id, " is under heavy load, adjusting task.")
+                # 动态调整任务
+            end
+
+            gpu_accelerated_update(grid)  # 使用GPU加速更新网格
         end
     end
     
@@ -100,19 +120,60 @@ function parallel_update_domain(grid::AMRGrid, num_workers::Int)
     end
 end
 
+"""
+    compute_task_load(grid::AMRGrid)
+
+根据每个网格的物理量计算当前任务的计算负载。
+"""
+function compute_task_load(grid::AMRGrid)
+    total_load = 0.0f32
+    for i in 1:length(grid.r)
+        total_load += abs(grid.grid_data[i])  # 假设负载与网格数据相关
+    end
+    return total_load / length(grid.r)
+end
+
 # ------------------------------
-# 多线程计算
+# 异步计算与优化通信
 # ------------------------------
 
 """
-    threaded_update(grid::AMRGrid)
+    async_gpu_exchange(data::Array{Float64}, device_id::Int)
 
-使用线程并行更新网格数据，适用于局部计算。
+异步GPU计算：将数据从CPU发送到GPU，执行计算后返回结果。
 """
-function threaded_update(grid::AMRGrid)
-    @threads for i in 1:length(grid.r)
-        # 线程安全的更新操作，假设每个线程独立处理一部分网格数据
-        grid.grid_data[i] .= grid.grid_data[i] + 0.1  # 示例更新物理量
+function async_gpu_exchange(data::Array{Float64}, device_id::Int)
+    if !CUDA.has_cuda()
+        @warn "GPU 不可用！"
+        return nothing
+    end
+    fut = @async begin
+        try
+            CUDA.device!(device_id)
+            d_data = CuArray(data)
+            d_result = d_data .^ 2  # 示例计算
+            result = Array(d_result)
+            return result
+        catch e
+            @warn "GPU 任务错误: $e"
+            return nothing
+        end
+    end
+    return fut
+end
+
+"""
+    async_mixed_communication(data::Array{Float64}, device_id::Int)
+
+混合异步通信：同时进行GPU计算和CPU计算，最后将结果汇总。
+"""
+function async_mixed_communication(data::Array{Float64}, device_id::Int)
+    gpu_future = async_gpu_exchange(data, device_id)
+    cpu_future = @async sum(data)
+    return @async begin
+        gpu_result = fetch(gpu_future)
+        cpu_result = fetch(cpu_future)
+        return (gpu_result, cpu_result)
     end
 end
 

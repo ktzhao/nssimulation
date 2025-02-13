@@ -1,0 +1,4 @@
+cat AMRModule.jl Communication.jl DomainDecomposition.jl EOSModule.jl GRMHDModule.jl GridModule.jl IOManager.jl MagneticFieldEvolution.jl ParallelComputationModule.jl TOVSolver.jl >combined.txt
+
+
+我希望使用julia编写一个TOV模拟软件，最终达到类似Einstein toolkit的效果，我是在使用julia编写代码，请输出符合语法和格式要求的代码，我希望每个jl模块文件前有一个简短的说明包括文件名，实现的功能，依赖等，同时使用中文对代码进行注释，不要用php或R等，我已经完成部分模块如下，由于字数限制，我会分成两部分发送，请在收到完整的两部分后进行分析，这是第一部分

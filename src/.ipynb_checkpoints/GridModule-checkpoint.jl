@@ -12,7 +12,8 @@ using Main.EOSModule
 export Grid, create_grid, apply_boundary_conditions,
        init_physical_fields!, update_physical_field!,
        read_config, get_refinement_level, update_refinement_level,
-       refine_grid_combined!, refine_grid_by_value!, refine_grid!
+       refine_grid_combined!, refine_grid_by_value!, refine_grid!,
+       AdaptiveMeshRefinement
 
 ##########################################################################
 # 网格数据结构定义
@@ -23,30 +24,6 @@ export Grid, create_grid, apply_boundary_conditions,
 
 存储模拟网格信息的结构体，支持多坐标系统、自适应网格（AMR）、多种边界条件，
 以及物理场数据和配置参数。
-
-字段说明：
-- coordinate_system::Symbol  
-    坐标系统，支持 :cartesian、:cylindrical、:spherical。
-- limits::Dict{Symbol,Tuple{Float64,Float64}}  
-    各方向的域边界，例如笛卡尔坐标下包含 :x, :y, :z。
-- spacing::Dict{Symbol,Float64}  
-    各方向的基础网格间距，用于生成均匀网格。
-- coordinates::Dict{Symbol,Vector{Float64}}  
-    各方向生成的网格坐标数组。
-- dims::Dict{Symbol,Int}  
-    各方向上的网格点数。
-- bc::Dict{Symbol,Any}  
-    边界条件设置，每个键对应一侧边界（如 :xlow、:xhigh），可取预定义类型（如 :Dirichlet、:Neumann、:Absorbing、:Periodic、:Mixed）或带参数的元组。
-- adaptive_params::Dict{Symbol,Tuple{Float64,Float64,Float64,Float64}}  
-    自适应网格参数，格式为 (refine_start, refine_end, fine_spacing, coarse_spacing)，用于指定局部细化区域。
-- custom_bc::Dict{Symbol,Function}  
-    用户自定义的边界处理函数，键与 bc 中对应，若存在则优先使用。
-- physical_fields::Dict{Symbol,Any}  
-    存储物理场数据，如密度、压力、磁场、电场等，数据类型由用户自行定义（一般为数组）。
-- config::Dict{Symbol,Any}  
-    存储从外部文件读取的配置参数。
-- refinement_level::Int  
-    当前网格的细化级别，用于动态调整物理模型（如EOS）。
 """
 struct Grid
     coordinate_system::Symbol
@@ -60,6 +37,18 @@ struct Grid
     physical_fields::Dict{Symbol, Any}
     config::Dict{Symbol, Any}
     refinement_level::Int  # 当前网格细化级别
+end
+
+# 新增：自适应网格细化的类型定义
+mutable struct AdaptiveMeshRefinement
+    grid_size::Int
+    max_refinement_level::Int
+    min_refinement_level::Int
+    refinement_threshold::Float64
+    spacing::Float64
+    coordinates::Dict{Symbol, Vector{Float64}}
+    physical_fields::Dict{Symbol, Any}
+    current_refinement_level::Int
 end
 
 ##########################################################################

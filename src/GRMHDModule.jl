@@ -5,7 +5,7 @@ using Main.GridModule
 using Main.EOSModule
 using Main.TOVSolver
 
-export evolve_grmhd, compute_grmhd_fluxes, update_grmhd_fields
+export evolve_grmhd, compute_grmhd_fluxes, update_grmhd_fields, compute_magnetic_field, compute_current_density, adaptive_grmhd_refinement, adaptive_magnetic_field_coupling
 
 # --------------------------
 # 求解GRMHD方程的核心函数
@@ -23,10 +23,9 @@ function evolve_grmhd(grid::Grid, eos::FiniteTempEOS, dt::Float64)
         P = eos.pressure(rho, T)
         
         # 根据压力和温度更新磁场
-        B = compute_magnetic_field(rho, T, P, eos)
+        B = compute_magnetic_field(grid, eos, rho, T, P)
         
         # 更新GRMHD方程中的其他物理量
-        # 例如计算电流密度、能量流等
         J = compute_current_density(grid, eos)
         flux = compute_grmhd_fluxes(grid, eos)
         
@@ -40,13 +39,17 @@ end
 # --------------------------
 
 """
-    compute_magnetic_field(rho::Float64, T::Float64, P::Float64, eos::FiniteTempEOS)
+    compute_magnetic_field(grid::Grid, eos::FiniteTempEOS, rho::Float64, T::Float64, P::Float64)
 
-该函数用于计算磁场强度，假设磁场和温度、密度等物理量相关。
+该函数用于计算磁场强度，磁场不仅与温度和密度相关，还与流体动力学的耦合因素相关。
 """
-function compute_magnetic_field(rho::Float64, T::Float64, P::Float64, eos::FiniteTempEOS)
-    # 假设磁场强度与温度和密度的关系
-    B = eos.magnetic_strength_factor * (rho^0.5) * (T^0.25)
+function compute_magnetic_field(grid::Grid, eos::FiniteTempEOS, rho::Float64, T::Float64, P::Float64)
+    # 计算磁场强度的基本因子
+    base_B = eos.magnetic_strength_factor * (rho^0.5) * (T^0.25)
+
+    # 进一步通过自适应磁场修正来考虑流体的影响
+    B = adaptive_magnetic_field_coupling(grid, eos, rho, T, base_B)
+
     return B
 end
 
@@ -110,7 +113,37 @@ function update_grmhd_fields!(grid::Grid, eos::FiniteTempEOS, dt::Float64, B::Ve
 end
 
 # --------------------------
-# 辅助函数与调度
+# 自适应磁场耦合
+# --------------------------
+
+"""
+    adaptive_magnetic_field_coupling(grid::Grid, eos::FiniteTempEOS, rho::Float64, T::Float64, base_B::Float64)
+
+根据流体的密度、温度等物理场的变化，调整磁场耦合强度。
+"""
+function adaptive_magnetic_field_coupling(grid::Grid, eos::FiniteTempEOS, rho::Float64, T::Float64, base_B::Float64)
+    # 基于密度、温度等物理量来调整磁场耦合因子
+    density_factor = 1.0 + (rho - eos.reference_density) / eos.reference_density
+    temperature_factor = 1.0 + (T - eos.reference_temperature) / eos.reference_temperature
+
+    # 自适应修正磁场
+    B = base_B * density_factor * temperature_factor
+    
+    # 进一步根据不同区域的物理条件调整磁场强度
+    # 例如，密度较大的区域磁场可能需要更强的耦合
+    for i in 1:length(grid.coordinates[:x])
+        if rho > eos.high_density_threshold
+            B[i] *= eos.high_density_magnetic_factor
+        elseif rho < eos.low_density_threshold
+            B[i] *= eos.low_density_magnetic_factor
+        end
+    end
+    
+    return B
+end
+
+# --------------------------
+# 自适应网格细化
 # --------------------------
 
 """
